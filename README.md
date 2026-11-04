@@ -1,67 +1,80 @@
-# dbtindb: run dbt models inside PostgreSQL and SQLite
+# dbtindb: run dbt projects inside PostgreSQL and SQLite
 
 [![CI](https://github.com/thejens/dbtindb/actions/workflows/ci.yml/badge.svg)](https://github.com/thejens/dbtindb/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![PostgreSQL 14–18 | SQLite 3.37+](https://img.shields.io/badge/PostgreSQL%2014–18%20%7C%20SQLite%203.37%2B-lightgrey)
 
-**dbtindb runs dbt-style SQL models inside the database.**
-You store the models as rows, and `SELECT dbtindb_run()` compiles them and builds every view and table in dependency order. There is no Python, no dbt CLI and no orchestrator to run.
+**dbtindb is dbt inside the database.** You store a dbt project's files as rows. Then `SELECT * FROM dbtindb_build()` seeds, builds, snapshots and tests it in DAG order, in one transaction. There is no Python, no dbt CLI, no profiles.yml and no orchestrator.
 
 ```sql
-INSERT INTO jinja_templates (name, source) VALUES
+INSERT INTO dbtindb_files (path, source) VALUES
   ('models/staging/stg_orders.sql',
    $$select id, customer_id, amount * 100 as amount_cents
-     from {{ source('public', 'raw_orders') }}$$),
-  ('models/customers.sql',
+     from {{ source('raw', 'orders') }}$$),
+  ('models/marts/customers.sql',
    $${{ config(materialized='table') }}
      select customer_id, sum(amount_cents) as total_cents
      from {{ ref('stg_orders') }}
-     group by 1$$);
+     group by 1$$),
+  ('models/schema.yml',
+   $$sources:
+       - name: raw
+         tables: [{name: orders}]
+     models:
+       - name: customers
+         columns:
+           - name: customer_id
+             data_tests: [unique, not_null]$$);
 
-SELECT * FROM dbtindb_run('analytics');
---  step |   model    | action |                 statement
--- ------+------------+--------+-------------------------------------------
---     1 | stg_orders | create | CREATE VIEW "analytics"."stg_orders" AS ...
---     2 | customers  | create | CREATE TABLE "analytics"."customers" AS ...
+SELECT step, name, action, status FROM dbtindb_build(target_schema => 'analytics');
+--  step |             name               |    action    | status
+-- ------+--------------------------------+--------------+---------
+--     1 | stg_orders                     | create view  | success
+--     2 | customers                      | create table | success
+--     3 | not_null_customers_customer_id | test         | pass
+--     4 | unique_customers_customer_id   | test         | pass
 ```
 
-- **dbt's own Jinja dialect:** models are rendered with the MiniJinja fork from [dbt v2](https://github.com/dbt-labs/dbt), the Rust engine that dbt itself uses, and not a lookalike.
-- **The dbt functions that shape a DAG:** `ref`, `source`, `config`, `var`, `this`, `target` and `is_incremental`, plus project-wide macros from `macros/`.
-- **Atomic builds:** a run happens in one transaction. If any model fails, nothing changes.
-- **Safe rebuilds:** dbtindb only drops relations it created, never uses `CASCADE`, and refuses to replace a table or view it did not create.
-- **Lineage in SQL:** `dbtindb_models()` lists each model's dependencies, sources and build order. `dbtindb_compile()` shows the SQL a model compiles to.
-- **Two databases, one project:** the same model files build in PostgreSQL (as an extension built with [pgrx](https://github.com/pgcentralfoundation/pgrx)) and in SQLite (as a loadable extension).
+- **dbt's own Jinja engine:** templates are rendered with the MiniJinja fork from [dbt v2](https://github.com/dbt-labs/dbt), the Rust engine that dbt itself uses, and not a lookalike.
+- **dbt's commands:** `build`, `run`, `seed`, `snapshot`, `test`, `ls` and `compile`, with dbt's node selection syntax (`+orders`, `tag:nightly`, `path:models/marts`, `@customers`, `config.materialized:table`, ...).
+- **dbt's materializations:** views, tables, ephemeral models, incremental models (append, delete+insert and merge, with `on_schema_change`), materialized views, seeds and snapshots.
+- **dbt's tests:** `unique`, `not_null`, `accepted_values`, `relationships`, your own `{% test %}` blocks and singular tests, with `severity`, `warn_if`, `error_if` and `where`.
+- **dbt project files:** `dbt_project.yml` with folder-level `+config`, property YAML files, `vars`, hooks, `generate_schema_name`/`generate_alias_name` overrides and `adapter.dispatch`.
+- **Atomic builds:** a command runs in one transaction. If a model or an error-severity test fails, nothing changes.
+- **Safe rebuilds:** dbtindb only replaces relations it created and never uses `CASCADE`. Your own views on top of a model block its rebuild instead of disappearing.
+- **Two databases, one project:** the same files build in PostgreSQL (as an extension built with [pgrx](https://github.com/pgcentralfoundation/pgrx)) and in SQLite (as a loadable extension).
 
-dbtindb is the third piece of a small family. It reads its models from the `jinja_templates` table of [pgjinja](https://github.com/thejens/pgjinja) (PostgreSQL) or [sqlite-jinja](https://github.com/thejens/sqlite-jinja) (SQLite), so the same rows can also be rendered with `jinja_render_named()`.
+dbtindb is the dbt-shaped sibling of [pgjinja](https://github.com/thejens/pgjinja) and [sqlite-jinja](https://github.com/thejens/sqlite-jinja), which render plain Jinja2 templates in SQL.
 
 ## Contents
 
-- [Why build dbt models inside the database?](#why-build-dbt-models-inside-the-database)
+- [Why run dbt inside the database?](#why-run-dbt-inside-the-database)
 - [Installation](#installation)
 - [Writing a project](#writing-a-project)
+- [Commands](#commands)
 - [PostgreSQL](#postgresql)
 - [SQLite](#sqlite)
 - [What is supported from dbt](#what-is-supported-from-dbt)
-- [How a run works](#how-a-run-works)
+- [How a command runs](#how-a-command-runs)
 - [FAQ](#faq)
 - [Development](#development)
 
-## Why build dbt models inside the database?
+## Why run dbt inside the database?
 
-dbt is the standard way to manage SQL transformations, but running it means having a Python or Rust CLI, a profile with credentials, and a scheduler somewhere that can reach the database. For many projects that is more machinery than the transformations need:
+dbt is the standard way to manage SQL transformations, but running it means having a CLI, a profile with credentials, and a scheduler somewhere that can reach the database. For many projects that is more machinery than the transformations need:
 
-- **An app's own database:** derived tables and reporting views that ship with the application and rebuild with one SQL call, from a migration, a cron job (`pg_cron`) or the app itself.
-- **SQLite files:** analytics databases, Datasette instances and local-first apps that carry their models inside the `.sqlite` file.
+- **An app's own database:** derived tables, reporting views and reference data that ship with the application and rebuild with one SQL call, from a migration, a cron job (`pg_cron`) or the app itself.
+- **SQLite files:** analytics databases, Datasette instances and local-first apps that carry their dbt project inside the `.sqlite` file.
 - **Locked-down environments:** where the only way in is a SQL connection.
 - **Prototyping:** you can try a dbt model in `psql` without setting up a project.
 
-dbtindb is not a replacement for dbt on a warehouse. It builds views and tables, the core of most dbt projects. It does not run tests, snapshots, seeds or incremental models (see [what is supported](#what-is-supported-from-dbt)).
+dbtindb is not a replacement for dbt on a warehouse. It covers the parts of dbt that a single database needs, and refuses the rest loudly (see [what is supported](#what-is-supported-from-dbt)).
 
 ## Installation
 
 dbtindb is built from source with a [Rust toolchain](https://rustup.rs). The first build fetches dbt's Jinja engine from [dbt-labs/dbt](https://github.com/dbt-labs/dbt), pinned to the v2.0.5 release.
 
-**PostgreSQL 14–18:** install [pgjinja](https://github.com/thejens/pgjinja#installation) first, then:
+**PostgreSQL 14–18:**
 
 ```sh
 cargo install cargo-pgrx --version 0.19.3 --locked
@@ -73,7 +86,7 @@ cargo pgrx install --release --no-default-features --features pg16
 ```
 
 ```sql
-CREATE EXTENSION pg_dbtindb CASCADE;   -- CASCADE also creates pgjinja
+CREATE EXTENSION pg_dbtindb;
 ```
 
 **SQLite 3.37.2 or newer:** this also needs libclang, which is used to generate the SQLite bindings.
@@ -87,140 +100,154 @@ cargo build --release -p sqlite_dbtindb
 
 ```sql
 .load ./target/release/libsqlite_dbtindb
+CREATE TABLE dbtindb_files (path TEXT PRIMARY KEY, source TEXT NOT NULL);
 ```
 
 ## Writing a project
 
-A project is a set of rows in `jinja_templates`, named like the files of a dbt project:
+A project is the set of rows in `dbtindb_files`, one per file, keyed by its path in a dbt project:
 
-| Name | What it is |
+| Path | What it is |
 |---|---|
-| `models/**/<name>.sql` | A model. It is built as a view or table called `<name>`, and other models `ref('<name>')` it. Directories are only for organisation, and model names must be unique across them, as in dbt. |
-| `macros/**/*.sql` | Macros. Every model can call them without an import. |
-| anything else | Available to `{% include %}`, `{% import %}` and `{% from ... import %}` by name. |
+| `dbt_project.yml` | Optional. `name`, `vars`, the `*-paths` settings, `on-run-start`/`on-run-end`, and `models:`/`seeds:`/`snapshots:`/`data_tests:` config trees with `+key` settings per folder. |
+| `models/**/<name>.sql` | A model, built as `<name>` (or its `alias`). Model names are unique across folders, as in dbt. |
+| `models/**/*.yml` | Properties: sources, descriptions, columns, tests and `config:` for models, seeds and snapshots. |
+| `seeds/**/<name>.csv` | A seed, loaded into a table with inferred column types (integer, numeric, boolean, date, timestamp, text) or `column_types`. |
+| `snapshots/**/*.sql` | `{% snapshot %}` blocks. |
+| `tests/**/*.sql` | Singular tests. `tests/generic/*.sql` holds `{% test %}` blocks. |
+| `macros/**/*.sql` | Macros and `{% test %}` blocks. Every file can call them without an import. |
 
-A model is one `SELECT` (a trailing `;` is allowed):
+Other files, such as docs `.md` files, are ignored. A model is one `SELECT` (a trailing `;` is allowed):
 
 ```sql
 -- models/marts/customer_orders.sql
-{{ config(materialized='table') }}
+{{ config(materialized='incremental', unique_key='customer_id') }}
 
-select
-    c.customer_id,
-    count(*)            as orders,
-    {{ cents('sum(o.amount)') }} as total_cents
-from {{ ref('stg_customers') }} c
-join {{ ref('stg_orders') }} o using (customer_id)
-where o.ordered_at >= '{{ var("since", "2020-01-01") }}'
+select customer_id, count(*) as orders, {{ cents('sum(amount)') }} as total_cents, max(ordered_at) as last_order
+from {{ ref('stg_orders') }}
+{% if is_incremental() %}
+where customer_id in (select customer_id from {{ ref('stg_orders') }} where ordered_at > (select max(last_order) from {{ this }}))
+{% endif %}
 group by 1
-```
-
-```sql
--- macros/money.sql
-{% macro cents(expr) %}round({{ expr }} * 100)::bigint{% endmacro %}
 ```
 
 To load an existing dbt project from disk, insert each file under its path relative to the project root. With the `sqlite3` CLI, which has a `readfile()` function:
 
 ```sh
 cd my_dbt_project
-find models macros -name '*.sql' | while read -r f; do
-  sqlite3 ../app.db "INSERT OR REPLACE INTO jinja_templates VALUES ('$f', CAST(readfile('$f') AS TEXT))"
+find dbt_project.yml models seeds snapshots tests macros -type f | while read -r f; do
+  sqlite3 ../app.db "INSERT OR REPLACE INTO dbtindb_files VALUES ('$f', CAST(readfile('$f') AS TEXT))"
 done
 ```
 
+With `psql`, `\set content `cat models/x.sql`` followed by `INSERT ... VALUES ('models/x.sql', :'content')` does the same.
+
+## Commands
+
+| Command | dbt equivalent | What it does |
+|---|---|---|
+| `dbtindb_build` | `dbt build` | Seeds, models, snapshots and tests in DAG order. Each node runs after the tests of the nodes it reads, and an error-severity test failure aborts the build. |
+| `dbtindb_run` | `dbt run` | Models |
+| `dbtindb_seed` | `dbt seed` | Seeds |
+| `dbtindb_snapshot` | `dbt snapshot` | Snapshots |
+| `dbtindb_test` | `dbt test` | Tests. Failures are reported as rows with status `fail`, and nothing is raised. |
+| `dbtindb_ls` | `dbt ls` | The selected nodes in build order, with lineage and relations |
+| `dbtindb_compile` | `dbt compile` | A model's, snapshot's or test's compiled SQL |
+
+Every command takes a selector (`--select`), an exclusion (`--exclude`), `vars` and `full_refresh`. Each step reports `step, unique_id, name, resource_type, action, status, failures, sql`. Here `action` is what was done (`create table`, `incremental (merge)`, `reload seed`, `update snapshot`, `refresh materialized view`, `test`, ...), and `sql` is every statement that ran for the node, hooks included.
+
+Selection follows dbt: space-separated items are a union and commas intersect. Graph operators are `+`, `n+`, `+n` and `@`. The selector methods are `fqn` (the default), `path`/`file`, `tag`, `resource_type`, `package`, `test_type`, `test_name`, `config.<key>` and `source`. Tests whose parents are all selected are included, as with dbt's default eager indirect selection.
+
 ## PostgreSQL
 
-| Function | Returns | Description |
-|---|---|---|
-| `dbtindb_run(target_schema text = 'public', vars jsonb = '{}')` | `TABLE(step, model, action, statement)` | Builds every enabled model into `target_schema` and returns the statements it ran. Creates the schema if needed. |
-| `dbtindb_compile(model text, target_schema text = 'public', vars jsonb = '{}')` | `text` | The SQL `model` compiles to, as `dbt compile` would show it. |
-| `dbtindb_models(target_schema text = 'public', vars jsonb = '{}')` | `TABLE(build_order, model, path, materialized, relation, depends_on text[], sources text[])` | The enabled models in build order, with their lineage. |
-
 ```sql
--- Build into a staging schema with different vars, check it, then go live.
-SELECT * FROM dbtindb_run('analytics_staging', '{"since": "2024-01-01"}');
+dbtindb_build(selector text = NULL, exclude text = NULL, vars jsonb = '{}',
+              full_refresh bool = false, target_schema text = 'public')
+  RETURNS TABLE(step int, unique_id text, name text, resource_type text,
+                action text, status text, failures bigint, sql text)
+-- dbtindb_run, dbtindb_seed, dbtindb_snapshot, dbtindb_test: the same
 
--- Which models read from raw.orders?
-SELECT model FROM dbtindb_models() WHERE '"raw"."orders"' = ANY (sources);
+dbtindb_ls(selector text = NULL, exclude text = NULL, vars jsonb = '{}', target_schema text = 'public')
+  RETURNS TABLE(build_order int, unique_id text, name text, resource_type text, materialized text,
+                relation text, path text, depends_on text[], sources text[], tags text[])
 
--- Rebuild nightly with pg_cron.
-SELECT cron.schedule('dbtindb', '0 3 * * *', $$SELECT dbtindb_run('analytics')$$);
+dbtindb_compile(name text, vars jsonb = '{}', target_schema text = 'public') RETURNS text
 ```
 
-`ref()` renders as `"<target_schema>"."<model>"` and `source('raw', 'orders')` as `"raw"."orders"`. Model names longer than PostgreSQL's 63-byte identifier limit are rejected, because Postgres would silently truncate them.
+```sql
+-- Rebuild the marts and everything they need, with a var.
+SELECT * FROM dbtindb_run('+tag:mart', vars => '{"since": "2024-01-01"}', target_schema => 'analytics');
 
-Relations built by dbtindb are recorded in `dbtindb_managed` (in the extension's schema), which `pg_dump` includes.
+-- Which models read from raw.orders?
+SELECT name FROM dbtindb_ls('source:raw.orders+', exclude => 'resource_type:test');
+
+-- Nightly with pg_cron.
+SELECT cron.schedule('dbtindb', '0 3 * * *', $$SELECT count(*) FROM dbtindb_build(target_schema => 'analytics')$$);
+```
+
+`target_schema` is dbt's `target.schema`. A model with `+schema: marts` is built into `<target_schema>_marts`, as dbt's default `generate_schema_name` does, and missing schemas are created. Identifiers longer than PostgreSQL's 63-byte limit are rejected, because Postgres would silently truncate them. `log()` and `exceptions.warn()` are raised as `NOTICE`s. With `persist_docs`, descriptions become `COMMENT`s.
+
+The project lives in `dbtindb_files`, and the relations dbtindb built are recorded in `dbtindb_managed`. Both are in the extension's schema, and `pg_dump` includes them.
 
 ## SQLite
 
-SQLite functions return a single value, so list results are JSON arrays that you can query with `json_each()`. Models are always built in the `main` schema, because a SQLite view can only reference objects in its own schema. `ref()` therefore renders as `"<model>"`, and `source('main', 'orders')` as `"orders"`.
+SQLite functions return a single value, so results are JSON that you can query with `json_each()`. Each function takes one optional argument: either a selector (`'+customers'`) or a JSON object `{"select": ..., "exclude": ..., "vars": {...}, "full_refresh": true}`.
 
 | Function | Returns |
 |---|---|
-| `dbtindb_run([vars])` | A JSON array of `{step, model, action, statement}` |
-| `dbtindb_compile(model [, vars])` | The compiled SQL |
-| `dbtindb_models([vars])` | A JSON array of `{build_order, model, path, materialized, relation, depends_on, sources}` |
-
-`vars` is JSON text, for example `'{"since": "2024-01-01"}'`.
+| `dbtindb_build([options])`, `dbtindb_run`, `dbtindb_seed`, `dbtindb_snapshot`, `dbtindb_test` | `{"steps": [...], "logs": [...]}`; each step is an object with the columns above, and `logs` holds `log()` and `exceptions.warn()` messages |
+| `dbtindb_ls([options])` | A JSON array of nodes |
+| `dbtindb_compile(name [, options])` | The compiled SQL |
 
 ```sql
-CREATE TABLE jinja_templates (name TEXT PRIMARY KEY, source TEXT NOT NULL);
--- ... insert models ...
-
-SELECT json_extract(value, '$.model'), json_extract(value, '$.action')
-FROM json_each(dbtindb_run());
-
-SELECT json_extract(value, '$.model') AS model, json_extract(value, '$.depends_on')
-FROM json_each(dbtindb_models());
+SELECT json_extract(value, '$.name'), json_extract(value, '$.status')
+FROM json_each(dbtindb_build('tag:nightly'), '$.steps');
 ```
 
-The functions are `DIRECTONLY`: they can be called from your SQL but not from views or triggers, where anyone who can change the schema could make other users run them. Built relations are recorded in `main.dbtindb_managed`.
+Everything is built in `main`, since a SQLite view can only reference objects in its own schema. `ref()` therefore renders as `"<name>"`, and a custom `schema` config is an error. Merge is not available as an incremental strategy (use delete+insert), and `persist_docs` does nothing, because SQLite has no comments. Seeds store booleans as 1/0.
 
-SQLite only checks a view's columns when the view is queried, so a model built as a view that references a missing column builds fine and fails on first use. Models built as tables fail during the run.
+The functions are `DIRECTONLY`: they can be called from your SQL but not from views or triggers, where anyone who can change the schema could make other users run them. A command runs in a savepoint, so inside your own transaction it commits or rolls back with it.
+
+SQLite only checks a view's columns when the view is queried, so a view model that references a missing column builds fine and fails on first use. Tables fail during the build.
 
 ## What is supported from dbt
 
 | | |
 |---|---|
-| `ref('model')` | ✅ Builds the dependency graph and renders the relation. Two-argument (cross-project) `ref` is not supported. |
-| `source('schema', 'table')` | ✅ Without `sources.yml`, the source name is the schema. Recorded as lineage. |
-| `config(materialized=...)` | ✅ `'view'` (default) and `'table'`. |
-| `config(enabled=false)` | ✅ The model is skipped, and a `ref` to it is an error, as in dbt. |
-| `config(tags=, meta=, docs=, description=, persist_docs=, group=, access=)` | Accepted and ignored. |
-| Other `config()` keys (`schema`, `alias`, `unique_key`, ...) | ❌ An error rather than a silently different build. |
-| `var('name', default)` | ✅ From the `vars` argument. |
-| `this`, `target.type`, `target.schema` | ✅ |
-| `is_incremental()` | Always `false`: every run is a full rebuild, as with `dbt run --full-refresh`. |
-| Macros in `macros/` | ✅ Global, as in dbt. A macro name defined twice is an error. |
-| Jinja: `{% set %}`, loops, filters, `{% call %}`, whitespace control, ... | ✅ dbt's MiniJinja fork. |
-| Incremental, snapshot, ephemeral and materialized-view materializations | ❌ |
-| Tests, seeds, hooks, `dbt_project.yml`, packages, adapter macros (`adapter.*`, `run_query`) | ❌ |
+| **Materializations** | `view`, `table`, `ephemeral` (inlined as CTEs), `incremental`, `materialized_view` (PostgreSQL), seeds and snapshots. Custom `{% materialization %}` blocks are not supported. |
+| **Incremental models** | `is_incremental()`, `{{ this }}`, `unique_key` (one or more columns), `incremental_strategy` `append`, `delete+insert` and `merge` (PostgreSQL), `on_schema_change` `ignore`, `fail`, `append_new_columns` and `sync_all_columns`, and `full_refresh` (per call or per model). |
+| **Snapshots** | `strategy='timestamp'` (`updated_at`) and `strategy='check'` (`check_cols`, or `'all'`), `unique_key`, `invalidate_hard_deletes` and `hard_deletes: invalidate`, with dbt's `dbt_scd_id`, `dbt_updated_at`, `dbt_valid_from` and `dbt_valid_to` columns. Snapshots go to `target_schema`, or the schema their config gives. |
+| **Seeds** | Type inference, `column_types`, `delimiter`. A reload keeps the table when its columns are unchanged. |
+| **Tests** | `unique`, `not_null`, `accepted_values` (`quote`), `relationships`, custom generic tests (`{% test %}`, with or without `arguments:`), singular tests, and `severity`, `warn_if`, `error_if`, `where` and `enabled` configs. Tests on sources work too. |
+| **Config** | `config()` in files, `config:` in property files, and `+key` in `dbt_project.yml`, merged as dbt does (tags union, hooks append). Keys: `materialized`, `schema`, `alias`, `enabled`, `tags`, `meta`, `pre_hook`, `post_hook`, `persist_docs`, `full_refresh`, plus the incremental, snapshot, seed and test keys above. |
+| **Hooks** | `pre_hook` and `post_hook` per node, `on-run-start` and `on-run-end` per project. Hooks can use `run_query`, `this` and `target`. |
+| **Jinja context** | `ref` (one argument), `source`, `config`, `var`, `env_var`, `this`, `target`, `execute`, `model`, `project_name`, `is_incremental`, `run_query` (agate-like rows and columns), `log`, `exceptions` (`raise_compiler_error`, `warn`), `adapter` (`dispatch`, `quote`, `get_relation`, `get_columns_in_relation`, `type`), `fromjson`, `tojson` and `local_md5`. |
+| **Macros** | Global, as in dbt, and they can override `generate_schema_name` and `generate_alias_name`. `adapter.dispatch` looks for `postgres__`/`sqlite__` macros, then `default__`. |
+| **Not supported** | Packages (`packages.yml`, `dbt deps`), cross-project or versioned `ref`, `database` configs, Python models, unit tests, exposures, metrics, semantic models, `{% docs %}` blocks, `store_failures`, `dbt source freshness` and `dbt docs`. Each is an error or ignored, never a silently different build. |
 
-On PostgreSQL, pgjinja's `jinja_templates` table checks each template with standard Jinja2 syntax. dbt-only block tags such as `{% docs %}` and `{% materialization %}` cannot be stored there. Model and macro files never need them.
+## How a command runs
 
-## How a run works
-
-1. Every template is read from `jinja_templates`, and every model is rendered. Rendering records the model's `ref`s, `source`s and `config`.
-2. The models are sorted topologically. A cycle is reported with its path, for example `dependency cycle: a -> c -> b -> a`.
-3. Every model relation that already exists is dropped, dependents first. Then every model is created in dependency order with `CREATE VIEW|TABLE ... AS <compiled SQL>`.
-4. All of this runs in one transaction: the caller's transaction on PostgreSQL, and a savepoint on SQLite. Any error rolls back the whole run.
+1. **Parse:** every file is read from `dbtindb_files`, and every model, snapshot and test is rendered with `execute = false`, as dbt's parser does. This collects `ref`s, `source`s and `config`. Disabled nodes are dropped, relations are named with `generate_schema_name`/`generate_alias_name`, and duplicate relations are reported.
+2. **Plan:** the selected nodes are ordered topologically. A cycle is reported with its path, for example `dependency cycle: a -> c -> b -> a`. Each node is planned as a replace, an update (incremental, snapshot, seed reload or materialized-view refresh) or a query (tests).
+3. **Execute:** schemas are created, then `on-run-start` runs. Replaced relations are dropped dependents-first, and nodes are built in order with their hooks. Models are rendered again here with `execute = true`, so `run_query` and `is_incremental()` see the database. Last comes `on-run-end`.
+4. All of this runs in one transaction: the caller's on PostgreSQL, and a savepoint on SQLite. Any error rolls back the whole command.
 
 Rebuilds are deliberately conservative:
 
-- dbtindb only drops relations listed in its `dbtindb_managed` table. If a table you created stands where a model would go, the run fails instead of replacing it.
-- Drops never cascade. On PostgreSQL, a view of yours that depends on a model makes the rebuild fail, so it is never silently dropped. Drop it, or make it a model too.
+- dbtindb only drops relations listed in `dbtindb_managed`. If a table you created stands where a model would go, the command fails instead of replacing it.
+- Drops never cascade. A managed view on top of a replaced model is rebuilt with it, but a view of yours makes the rebuild fail, so it is never silently dropped.
 - Renders have an instruction budget, so a runaway macro cannot pin a database backend.
+- A model cannot call a dbtindb function: a build cannot start another build.
 
 ## FAQ
 
 ### Is this dbt?
 
-No. dbtindb uses dbt's Jinja engine and follows dbt's conventions for models, macros, `ref` and `source`, so dbt models that stick to [the supported features](#what-is-supported-from-dbt) compile unchanged. It does not use dbt's parser, adapters, manifest or CLI, and it is not affiliated with dbt Labs.
+No. dbtindb uses dbt's Jinja engine and follows dbt's project layout, configs, commands and semantics, so projects that stick to [the supported features](#what-is-supported-from-dbt) run unchanged. It does not use dbt's Python or Fusion runtime, adapters or manifest, and it is not affiliated with dbt Labs.
 
 ### Why not just run dbt?
 
-You should if you already run dbt, or if you need tests, snapshots, incremental models or a warehouse. dbtindb is for cases where an external process is the problem: models that ship inside an application database or a SQLite file, rebuilds triggered from SQL or `pg_cron`, and environments where you only have a SQL connection.
+You should if you already run dbt, or if you need packages, a warehouse or the wider dbt ecosystem. dbtindb is for cases where an external process is the problem: projects that ship inside an application database or a SQLite file, builds triggered from SQL or `pg_cron`, and environments where you only have a SQL connection.
 
 ### Can I use it on Amazon RDS, Cloud SQL, Supabase or Neon?
 
@@ -228,21 +255,22 @@ Only where you can install custom extensions, which managed services generally d
 
 ### Who can run a build?
 
-On PostgreSQL, `dbtindb_run` runs with the caller's privileges. It needs `CREATE` on the target schema, `SELECT` on the sources and on `jinja_templates`, and write access to the bookkeeping table:
+On PostgreSQL, the commands run with the caller's privileges. They need `CREATE` on the target schemas (or on the database, to create them), `SELECT` on the sources and on `dbtindb_files`, and write access to the bookkeeping table:
 
 ```sql
+GRANT SELECT ON dbtindb_files TO builder;
 GRANT SELECT, INSERT, DELETE ON dbtindb_managed TO builder;
 ```
 
- Anyone who can write to `jinja_templates` decides what SQL the next run executes, so grant that like DDL rights.
+Anyone who can write to `dbtindb_files` decides what SQL the next build executes, so grant that like DDL rights.
 
 ## Development
 
 ```sh
-# Core (compilation, ordering, planning)
+# Core: parsing, selection, ordering, compilation
 cargo test -p dbtindb-core
 
-# PostgreSQL extension; installs pgjinja into the pgrx-managed Postgres first
+# PostgreSQL extension, in a pgrx-managed Postgres
 cargo pgrx test pg16 -p pg_dbtindb
 
 # SQLite extension, end to end through Python's sqlite3
@@ -250,7 +278,7 @@ cargo build --release -p sqlite_dbtindb
 python3 -m unittest discover -s crates/sqlite_dbtindb/tests -v
 ```
 
-The workspace has three crates. `dbtindb-core` compiles models, orders them and plans the statements, and is shared by both databases. `pg_dbtindb` and `sqlite_dbtindb` read the project from the database and execute the plan.
+The workspace has three crates. `dbtindb-core` holds the dbt semantics: the project, the Jinja context, selection, the DAG and the materializations. It drives the database through a small `Database` trait. `pg_dbtindb` (over SPI) and `sqlite_dbtindb` (over the SQLite C API) implement that trait and expose the SQL functions.
 
 ## License
 

@@ -12,6 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use libsqlite3_sys as ffi;
+use serde_json::Value;
 
 /// One SQL argument value. Borrowed text is valid for the duration of the
 /// function call it was read in; other values are only told apart by type.
@@ -68,56 +69,62 @@ impl<'a> Call<'a> {
 pub struct Db(*mut ffi::sqlite3);
 
 impl Db {
-    /// Runs one statement with text parameters and returns every row, each
-    /// column as text (NULL as `None`).
-    pub fn query(&self, sql: &str, params: &[&str]) -> Result<Vec<Vec<Option<String>>>, String> {
+    /// Runs one statement with text parameters (`None` binds NULL) and
+    /// returns its column names and every row, values typed as JSON.
+    pub fn query(
+        &self,
+        sql: &str,
+        params: &[Option<&str>],
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>), String> {
         let stmt = self.prepare(sql)?;
         for (i, p) in params.iter().enumerate() {
+            let n = c_int::try_from(i + 1).expect("few parameters");
             // SAFETY: valid statement; SQLite copies the text (TRANSIENT).
             let rc = unsafe {
-                ffi::sqlite3_bind_text(
-                    stmt.0,
-                    c_int::try_from(i + 1).expect("few parameters"),
-                    p.as_ptr().cast(),
-                    len_c_int(p.len()),
-                    ffi::SQLITE_TRANSIENT(),
-                )
+                match p {
+                    Some(p) => ffi::sqlite3_bind_text(
+                        stmt.0,
+                        n,
+                        p.as_ptr().cast(),
+                        len_c_int(p.len()),
+                        ffi::SQLITE_TRANSIENT(),
+                    ),
+                    None => ffi::sqlite3_bind_null(stmt.0, n),
+                }
             };
             if rc != ffi::SQLITE_OK {
                 return Err(self.errmsg());
             }
         }
+        // SAFETY: valid statement.
+        let width = unsafe { ffi::sqlite3_column_count(stmt.0) };
+        let columns = (0..width)
+            .map(|c| {
+                // SAFETY: `c` is a valid column index of a prepared statement.
+                let p = unsafe { ffi::sqlite3_column_name(stmt.0, c) };
+                if p.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+                }
+            })
+            .collect();
         let mut rows = Vec::new();
         loop {
             // SAFETY: valid statement, stepped on its own connection.
             match unsafe { ffi::sqlite3_step(stmt.0) } {
-                ffi::SQLITE_ROW => {
-                    // SAFETY: a row is current; columns are read pointer
-                    // first, then length, as for arguments.
-                    let row = unsafe {
-                        (0..ffi::sqlite3_column_count(stmt.0))
-                            .map(|c| {
-                                let p = ffi::sqlite3_column_text(stmt.0, c);
-                                let n = ffi::sqlite3_column_bytes(stmt.0, c);
-                                if p.is_null() {
-                                    Ok(None)
-                                } else {
-                                    String::from_utf8(slice(p.cast(), n).to_vec())
-                                        .map(Some)
-                                        .map_err(|_| "query returned invalid UTF-8".to_owned())
-                                }
-                            })
-                            .collect::<Result<Vec<_>, _>>()?
-                    };
-                    rows.push(row);
-                }
-                ffi::SQLITE_DONE => return Ok(rows),
+                ffi::SQLITE_ROW => rows.push(
+                    (0..width)
+                        .map(|c| unsafe { column(stmt.0, c) })
+                        .collect::<Result<_, _>>()?,
+                ),
+                ffi::SQLITE_DONE => return Ok((columns, rows)),
                 _ => return Err(self.errmsg()),
             }
         }
     }
 
-    /// Runs SQL without parameters or results (DDL, savepoints).
+    /// Runs SQL without parameters or results; may hold several statements.
     pub fn exec(&self, sql: &str) -> Result<(), String> {
         let sql = CString::new(sql).map_err(|_| "SQL contains a NUL byte".to_owned())?;
         // SAFETY: valid connection; no callback, so no error string is
@@ -158,6 +165,28 @@ impl Db {
         unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+/// Column `c` of the current row, as JSON.
+///
+/// # Safety
+/// `stmt` must have a current row.
+unsafe fn column(stmt: *mut ffi::sqlite3_stmt, c: c_int) -> Result<Value, String> {
+    // SAFETY: forwarded; text is read pointer first, then length.
+    unsafe {
+        Ok(match ffi::sqlite3_column_type(stmt, c) {
+            ffi::SQLITE_INTEGER => Value::from(ffi::sqlite3_column_int64(stmt, c)),
+            ffi::SQLITE_FLOAT => serde_json::Number::from_f64(ffi::sqlite3_column_double(stmt, c))
+                .map_or(Value::Null, Value::Number),
+            ffi::SQLITE_NULL => Value::Null,
+            // Text, and blobs shown as their text.
+            _ => {
+                let p = ffi::sqlite3_column_text(stmt, c);
+                let n = ffi::sqlite3_column_bytes(stmt, c);
+                Value::from(String::from_utf8_lossy(slice(p.cast(), n)).into_owned())
+            }
+        })
     }
 }
 

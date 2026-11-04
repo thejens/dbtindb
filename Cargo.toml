@@ -14,7 +14,10 @@ repository = "https://github.com/thejens/dbtindb"
 # pinned to the commit of the v2.0.5 release tag (the same pin dbt-temporal
 # uses). Its default features are required: dbt only builds it that way.
 minijinja = { git = "https://github.com/dbt-labs/dbt", rev = "a3bdd96bf62f02c8babb060a79f32de6998c235a", package = "minijinja", features = ["loader", "custom_syntax", "preserve_order", "fuel"] }
-serde_json = "1.0.154"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+serde-saphyr = { version = "2.1.0", default-features = false, features = ["deserialize"] }
+csv = "1.4.0"
+md-5 = "0.11.0"
 
 [profile.release]
 opt-level = 3

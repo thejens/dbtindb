@@ -8,10 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PGRX_VERSION: 0.19.3
-  # pg_dbtindb reads models from pgjinja's jinja_templates table, so the
-  # tests install pgjinja first. Pinned, so a pgjinja change cannot break
-  # this repo's CI unnoticed.
-  PGJINJA_REV: 6338f16b6181cbc401bc75c02744e13fd7cfbdf3
 
 jobs:
   postgres:
@@ -49,13 +45,6 @@ jobs:
 
       - name: Initialise pgrx
         run: cargo pgrx init "--pg$PG" "$PG_CONFIG"
-
-      - name: Install pgjinja
-        run: |
-          git clone https://github.com/thejens/pgjinja "$RUNNER_TEMP/pgjinja"
-          cd "$RUNNER_TEMP/pgjinja"
-          git checkout "$PGJINJA_REV"
-          cargo pgrx install --release --pg-config "$PG_CONFIG" --no-default-features --features "pg$PG"
 
       - name: Lint
         if: matrix.pg == 18

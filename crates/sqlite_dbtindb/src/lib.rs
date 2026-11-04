@@ -1,6 +1,7 @@
 //! dbtindb for SQLite: a run-time loadable extension that builds dbt-style
-//! Jinja SQL models from the `jinja_templates` table, inside the database.
+//! Jinja SQL models from the `dbtindb_files` table, inside the database.
 
+mod database;
 mod functions;
 mod sqlite;
 

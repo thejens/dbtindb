@@ -1,0 +1,383 @@
+//! dbt's Jinja context: the environment every model, macro, test, hook and
+//! snapshot renders in.
+//!
+//! One [`Shared`] value holds the run's state. Jinja functions are
+//! `'static`, so they reach the node being rendered through
+//! [`Shared::current`], which the parser and the runner set before each
+//! render.
+
+mod builtins;
+mod objects;
+mod relation;
+mod table;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, RwLock};
+
+use md5::{Digest, Md5};
+use minijinja::constants;
+use minijinja::value::ValueMap;
+use minijinja::{Environment, Error, ErrorKind, State, Value};
+use serde_json::{Map, Value as Json};
+
+pub use objects::to_jinja;
+pub use relation::Relation;
+
+use self::objects::{
+    Adapter, Args, ConfigObject, Exceptions, Execute, Impl, ModelObject, NativeFn, This,
+};
+use crate::project::{Project, SourceTable};
+use crate::{Config, Database, Dialect};
+
+/// Per-render instruction budget, so a runaway macro cannot pin a database
+/// backend: rendering never returns control to the database until it ends.
+const FUEL: u64 = 50_000_000;
+
+/// What `ref('<name>')` resolves to.
+#[derive(Clone, Debug)]
+pub struct RefTarget {
+    pub unique_id: String,
+    pub relation: Relation,
+    pub ephemeral: bool,
+    pub enabled: bool,
+}
+
+/// The node being rendered, and what its rendering recorded.
+#[derive(Default)]
+pub struct Current {
+    /// False while parsing (dbt's `execute`), true while building.
+    pub execute: bool,
+    pub node: String,
+    pub this: Option<Relation>,
+    pub model: Map<String, Json>,
+    /// The node's config: collected by `config()` while parsing, final
+    /// while executing (what `config.get()` reads).
+    pub config: Config,
+    pub refs: BTreeSet<String>,
+    pub sources: BTreeSet<(String, String)>,
+    pub is_incremental: bool,
+    /// Ephemeral models `ref()`ed while executing, in order of first use.
+    pub ctes: Vec<String>,
+    /// While executing: the refs found while parsing. A ref outside them
+    /// would be built out of order.
+    pub parsed_refs: Option<BTreeSet<String>>,
+}
+
+pub struct Shared {
+    pub dialect: Dialect,
+    pub project_name: String,
+    pub target_schema: String,
+    pub database_name: String,
+    pub vars: Map<String, Json>,
+    pub db: Option<Arc<dyn Database>>,
+    pub names: RwLock<BTreeMap<String, RefTarget>>,
+    pub sources: BTreeMap<(String, String), SourceTable>,
+    pub current: Mutex<Current>,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<dbtindb context>")
+    }
+}
+
+impl Shared {
+    pub fn relation(&self, schema: &str, identifier: &str) -> Relation {
+        Relation::new(self.dialect, &self.database_name, schema, identifier)
+    }
+
+    /// The database, but only while executing: dbt runs no queries while
+    /// it parses.
+    pub fn db_when_executing(&self) -> Option<&Arc<dyn Database>> {
+        if self.current.lock().unwrap().execute {
+            self.db.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn log(&self, msg: &str) {
+        if let Some(db) = self.db_when_executing() {
+            db.log(msg);
+        }
+    }
+
+    /// Starts rendering `node`, clearing what the previous render recorded.
+    pub fn begin(
+        &self,
+        execute: bool,
+        node: &str,
+        this: Option<Relation>,
+        model: Map<String, Json>,
+        config: Config,
+    ) {
+        *self.current.lock().unwrap() = Current {
+            execute,
+            node: node.to_owned(),
+            this,
+            model,
+            config,
+            ..Current::default()
+        };
+    }
+
+    /// Ends a render, returning what it recorded.
+    pub fn finish(&self) -> Current {
+        std::mem::take(&mut *self.current.lock().unwrap())
+    }
+}
+
+/// Builds the environment for `project`, with its macros registered in
+/// dbt's global macro namespace.
+pub fn environment(
+    project: &Project,
+    shared: Arc<Shared>,
+) -> Result<Environment<'static>, crate::Error> {
+    let mut env = Environment::new();
+    env.set_fuel(Some(FUEL));
+    let files = Arc::new(project.files.clone());
+    env.set_loader(move |name| Ok(files.get(name).cloned()));
+
+    // The fork resolves an unknown name `m` as the template `<pkg>.m`:
+    // first in this project, then in the built-in "dbt" package.
+    let pkg = shared.project_name.clone();
+    env.add_global(constants::ROOT_PACKAGE_NAME, Value::from(pkg.as_str()));
+    env.add_global(constants::TARGET_PACKAGE_NAME, Value::from(pkg.as_str()));
+    env.add_global(constants::DIALECT, Value::from(shared.dialect.name()));
+
+    let mut builtin_names = ValueMap::new();
+    for name in macro_names(&mut env, builtins::BUILTINS_PATH, builtins::BUILTINS)? {
+        env.add_template_owned(
+            format!("dbt.{name}"),
+            builtins::BUILTINS.to_owned(),
+            Some(builtins::BUILTINS_PATH.into()),
+        )?;
+        builtin_names.insert(Value::from(name.as_str()), Value::from("dbt"));
+    }
+    let mut namespaces = ValueMap::new();
+    namespaces.insert(
+        Value::from(shared.dialect.name()),
+        Value::from_object(builtin_names),
+    );
+    env.add_global(
+        constants::DBT_AND_ADAPTERS_NAMESPACE,
+        Value::from_object(namespaces),
+    );
+
+    let mut owners: BTreeMap<String, String> = BTreeMap::new();
+    for path in &project.macro_files {
+        let source = &project.files[path];
+        for name in macro_names(&mut env, path, source)? {
+            if let Some(other) = owners.insert(name.clone(), path.clone()) {
+                return Err(crate::Error::new(format!(
+                    "macro {name:?} is defined in both {other} and {path}"
+                )));
+            }
+            env.add_template_owned(format!("{pkg}.{name}"), source.clone(), Some(path.clone()))?;
+        }
+    }
+
+    env.add_global(
+        "target",
+        Value::from_serialize(serde_json::json!({
+            "name": "default",
+            "type": shared.dialect.name(),
+            "schema": shared.target_schema,
+            "database": shared.database_name,
+            "profile_name": pkg,
+            "threads": 1,
+        })),
+    );
+    env.add_global("project_name", Value::from(pkg.as_str()));
+    env.add_global("config", Value::from_object(ConfigObject(shared.clone())));
+    env.add_global("adapter", Value::from_object(Adapter(shared.clone())));
+    env.add_global("exceptions", Value::from_object(Exceptions(shared.clone())));
+    env.add_global("this", Value::from_object(This(shared.clone())));
+    env.add_global("execute", Value::from_object(Execute(shared.clone())));
+    env.add_global("model", Value::from_object(ModelObject(shared.clone())));
+
+    let functions: [(&'static str, Impl); 10] = [
+        ("ref", ref_fn),
+        ("source", source_fn),
+        ("var", var_fn),
+        ("env_var", env_var_fn),
+        ("is_incremental", |s, _, _| {
+            Ok(Value::from(s.current.lock().unwrap().is_incremental))
+        }),
+        ("run_query", run_query_fn),
+        ("log", log_fn),
+        ("fromjson", |_, _, a| {
+            let text = a.string(0, "string")?;
+            serde_json::from_str::<Json>(&text)
+                .map(|v| Value::from_serialize(&v))
+                .map_err(|e| jinja_error(format!("fromjson(): {e}")))
+        }),
+        ("tojson", |_, _, a| {
+            let v = a.get(0, "value").unwrap_or_default();
+            Ok(Value::from(
+                serde_json::to_string(&to_json(&v)?).unwrap_or_default(),
+            ))
+        }),
+        ("local_md5", |_, _, a| {
+            let digest = Md5::digest(a.string(0, "value")?.as_bytes());
+            Ok(Value::from(
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            ))
+        }),
+    ];
+    for (name, f) in functions {
+        env.add_global(
+            name,
+            Value::from_object(NativeFn {
+                shared: shared.clone(),
+                name,
+                f,
+            }),
+        );
+    }
+    Ok(env)
+}
+
+/// The macros (and `{% test %}`/`{% snapshot %}` blocks) a file defines.
+pub fn macro_names(
+    env: &mut Environment<'static>,
+    path: &str,
+    source: &str,
+) -> Result<Vec<String>, crate::Error> {
+    env.add_template_owned(path.to_owned(), source.to_owned(), Some(path.to_owned()))?;
+    let template = env.get_template(path)?;
+    let state = template
+        .eval_to_state((), &[])
+        .map_err(|e| crate::Error::new(format!("loading macros from {path}: {e}")))?;
+    let mut names: Vec<String> = state
+        .exports()
+        .into_iter()
+        // Macro objects expose their `arguments`; a top-level {% set %}
+        // value does not, and is not a macro.
+        .filter(|n| {
+            state
+                .lookup(n, &[])
+                .and_then(|v| v.get_attr("arguments").ok())
+                .is_some_and(|a| !a.is_undefined())
+        })
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+fn ref_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    if a.kwarg_names().iter().any(|k| k == "v" || k == "version") {
+        return Err(jinja_error("ref() with a model version is not supported"));
+    }
+    let name = match a.positional {
+        [name] => name,
+        [package, name] if package.as_str() == Some(s.project_name.as_str()) => name,
+        [package, _] => {
+            return Err(jinja_error(format!(
+                "ref() to package {package}: packages are not supported"
+            )));
+        }
+        _ => {
+            return Err(jinja_error(
+                "ref() takes the name of a model, seed or snapshot",
+            ));
+        }
+    };
+    let name = name
+        .as_str()
+        .ok_or_else(|| jinja_error("ref(): the name must be a string"))?;
+    let target = s.names.read().unwrap().get(name).cloned();
+    let mut cur = s.current.lock().unwrap();
+    let Some(target) = target else {
+        return Err(jinja_error(format!(
+            "{} refs {name:?}, which is not a model, seed or snapshot in this project",
+            cur.node
+        )));
+    };
+    if !target.enabled {
+        return Err(jinja_error(format!(
+            "{} refs {name:?}, which is disabled (enabled=false)",
+            cur.node
+        )));
+    }
+    if let Some(parsed) = &cur.parsed_refs
+        && !parsed.contains(&target.unique_id)
+    {
+        return Err(jinja_error(format!(
+            "{} refs {name:?} only when executing, so dbtindb cannot order it; \
+                 add `-- depends_on: {{{{ ref('{name}') }}}}` to the file",
+            cur.node
+        )));
+    }
+    cur.refs.insert(target.unique_id.clone());
+    if target.ephemeral && cur.execute {
+        if !cur.ctes.contains(&target.unique_id) {
+            cur.ctes.push(target.unique_id.clone());
+        }
+        return Ok(Relation::cte(s.dialect, name).into_value());
+    }
+    Ok(target.relation.into_value())
+}
+
+fn source_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    let source = a.string(0, "source_name")?;
+    let table = a.string(1, "table_name")?;
+    let key = (source.clone(), table.clone());
+    // Without a property file declaring it, the source name is the schema.
+    let (schema, identifier) = match s.sources.get(&key) {
+        Some(t) => (t.schema.clone(), t.identifier.clone()),
+        None => (source, table),
+    };
+    s.current.lock().unwrap().sources.insert(key);
+    Ok(s.relation(&schema, &identifier).into_value())
+}
+
+fn var_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    let name = a.string(0, "name")?;
+    match (s.vars.get(&name), a.get(1, "default")) {
+        (Some(v), _) => Ok(Value::from_serialize(v)),
+        (None, Some(d)) => Ok(d),
+        (None, None) => Err(jinja_error(format!(
+            "required var {name:?} not found; pass it in the vars argument or set it in dbt_project.yml"
+        ))),
+    }
+}
+
+/// The database server's environment is not the project's to read; vars
+/// take its place. A default is honoured so projects still compile.
+fn env_var_fn(_: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    let name = a.string(0, "var")?;
+    a.get(1, "default").ok_or_else(|| {
+        jinja_error(format!(
+            "env_var({name:?}): environment variables are not available inside the database; use var() instead"
+        ))
+    })
+}
+
+fn run_query_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    let sql = a.string(0, "sql")?;
+    // As in dbt, run_query() returns None while parsing; guard uses of
+    // its result with `{% if execute %}`.
+    let Some(db) = s.db_when_executing() else {
+        return Ok(Value::from(()));
+    };
+    Ok(table::TableObject::value(db.query(&sql).map_err(to_jinja)?))
+}
+
+fn log_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    let msg = a.get(0, "msg").map(|v| v.to_string()).unwrap_or_default();
+    s.log(&msg);
+    Ok(Value::from(""))
+}
+
+pub fn jinja_error(msg: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidOperation, msg.into())
+}
+
+pub fn to_json(v: &Value) -> Result<Json, Error> {
+    serde_json::to_value(v).map_err(|e| jinja_error(format!("cannot convert {v} to JSON: {e}")))
+}

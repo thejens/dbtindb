@@ -1,47 +1,27 @@
-//! The SQL functions: `dbtindb_compile`, `dbtindb_models` and `dbtindb_run`.
-//!
-//! SQLite scalar functions return one value, so the list-shaped results are
-//! JSON arrays, ready for `json_each()`.
+//! The SQL functions. SQLite scalar functions return one value, so list
+//! results are JSON, ready for `json_each()`.
 
 use std::cell::Cell;
 use std::ffi::{CStr, c_int};
+use std::sync::Arc;
 
-use dbtindb_core::{
-    CompiledModel, Dialect, Error, Existing, ExistingKind, Project, Statement, Target, build_order,
-    compile, plan,
-};
+use dbtindb_core::{Command, Dialect, Error, Invocation, Target};
 use libsqlite3_sys as ffi;
-use serde_json::{Value, json};
+use md5::{Digest, Md5};
+use serde_json::json;
 
+use crate::database::{MANAGED_DDL, SqliteDb};
 use crate::sqlite::{self, Arg, Call, Db};
 
-/// The table dbtindb reads models from: the same one sqlite-jinja's
-/// `jinja_render_named` renders from.
-const TEMPLATES_DDL: &str =
-    "CREATE TABLE jinja_templates (name TEXT PRIMARY KEY, source TEXT NOT NULL)";
-
-/// Relations created by `dbtindb_run()`. dbtindb only ever drops relations
-/// listed here. SQLite resolves identifiers case-insensitively, so lookups
-/// do too.
-const MANAGED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.dbtindb_managed (
-    relation_name TEXT PRIMARY KEY COLLATE NOCASE,
-    path          TEXT NOT NULL,
-    materialized  TEXT NOT NULL CHECK (materialized IN ('view', 'table')),
-    built_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-)";
-
-/// Models are always built in `main`: a SQLite view can only reference
-/// objects in its own schema.
-const SCHEMA: &str = "main";
+/// The table dbtindb reads the project from: one row per project file.
+const FILES_DDL: &str = "CREATE TABLE dbtindb_files (path TEXT PRIMARY KEY, source TEXT NOT NULL)";
 
 thread_local! {
-    /// Set while `dbtindb_run` executes model SQL on this thread. A model
-    /// that calls `dbtindb_run` itself would rebuild the project from
-    /// inside its own build.
+    /// Set while a command runs on this thread. Model SQL that called a
+    /// dbtindb function would rebuild the project from inside its own build.
     static RUNNING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The Rust side of one SQL function.
 type Impl = fn(&Call<'_>) -> Result<String, Error>;
 
 /// Registers the functions on `db`.
@@ -49,113 +29,151 @@ type Impl = fn(&Call<'_>) -> Result<String, Error>;
 /// # Safety
 /// `db` must be an open connection.
 pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
-    // All of them read jinja_templates and so are not deterministic.
-    // DIRECTONLY keeps them out of views, triggers and generated columns,
-    // where whoever can write the schema could make other users run them.
+    // They read dbtindb_files and the schema, so they are not
+    // deterministic. DIRECTONLY keeps them out of views, triggers and
+    // generated columns, where whoever can write the schema could make
+    // other users run them.
     let flags = ffi::SQLITE_UTF8 | ffi::SQLITE_DIRECTONLY;
-    let functions: [(&CStr, c_int, Impl); 6] = [
-        (c"dbtindb_compile", 1, dbtindb_compile),
-        (c"dbtindb_compile", 2, dbtindb_compile),
-        (c"dbtindb_models", 0, dbtindb_models),
-        (c"dbtindb_models", 1, dbtindb_models),
-        (c"dbtindb_run", 0, dbtindb_run),
-        (c"dbtindb_run", 1, dbtindb_run),
+    let functions: [(&CStr, &[c_int], Impl); 8] = [
+        (c"dbtindb_build", &[0, 1], |c| command(c, Command::Build)),
+        (c"dbtindb_run", &[0, 1], |c| command(c, Command::Run)),
+        (c"dbtindb_seed", &[0, 1], |c| command(c, Command::Seed)),
+        (c"dbtindb_snapshot", &[0, 1], |c| {
+            command(c, Command::Snapshot)
+        }),
+        (c"dbtindb_test", &[0, 1], |c| command(c, Command::Test)),
+        (c"dbtindb_ls", &[0, 1], ls),
+        (c"dbtindb_compile", &[1, 2], compile),
+        (c"dbtindb_md5", &[1], md5),
     ];
-    for (name, n_arg, f) in functions {
-        // SAFETY: forwarded from the caller.
-        unsafe {
-            sqlite::create_function(
-                db,
-                name,
-                n_arg,
-                flags,
-                Box::new(move |call| f(call).map_err(|e| format!("dbtindb: {e}"))),
-            )?;
+    for (name, arities, f) in functions {
+        for &n in arities {
+            let pure = name == c"dbtindb_md5";
+            let flags = if pure {
+                ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC
+            } else {
+                flags
+            };
+            // SAFETY: forwarded from the caller.
+            unsafe {
+                sqlite::create_function(
+                    db,
+                    name,
+                    n,
+                    flags,
+                    Box::new(move |call| f(call).map_err(|e| format!("dbtindb: {e}"))),
+                )?;
+            }
         }
     }
     Ok(())
 }
 
-/// `dbtindb_compile(model [, vars])`: the model compiled to plain SQL.
-fn dbtindb_compile(call: &Call<'_>) -> Result<String, Error> {
-    let model = match call.arg(0) {
-        Arg::Text(t) => utf8(t)?,
-        other => {
-            return Err(Error::new(format!(
-                "model must be text, not {}",
-                type_name(other)
-            )));
-        }
+/// Builds (part of) the project inside a savepoint: if anything fails,
+/// everything it did is rolled back, and inside a caller's transaction it
+/// commits or rolls back with that transaction.
+fn command(call: &Call<'_>, cmd: Command) -> Result<String, Error> {
+    let inv = Invocation::parse(text_arg(call, 0, "options")?)?;
+    let raw = call.db();
+    let _running = Running::enter()?;
+    raw.exec("SAVEPOINT dbtindb").map_err(Error::new)?;
+    let result = (|| -> Result<String, Error> {
+        raw.exec(MANAGED_DDL).map_err(Error::new)?;
+        let (session, db) = load(raw, &inv)?;
+        let steps = dbtindb_core::invoke(&session, cmd, &inv.options)?;
+        let logs = std::mem::take(&mut *db.logs.lock().unwrap());
+        Ok(json!({"steps": dbtindb_core::steps_json(&steps), "logs": logs}).to_string())
+    })();
+    let end = match &result {
+        Ok(_) => raw.exec("RELEASE dbtindb"),
+        Err(_) => raw
+            .exec("ROLLBACK TO dbtindb")
+            .and_then(|()| raw.exec("RELEASE dbtindb")),
     };
-    let models = compile_project(call.db(), &vars(call.arg(1))?)?;
-    models
-        .into_iter()
-        .find(|m| m.name == model)
-        .map(|m| m.sql)
-        .ok_or_else(|| Error::new(format!("no enabled model named {model:?}")))
-}
-
-/// `dbtindb_models([vars])`: the enabled models in build order, with their
-/// lineage, as a JSON array.
-fn dbtindb_models(call: &Call<'_>) -> Result<String, Error> {
-    let models = compile_project(call.db(), &vars(call.arg(0))?)?;
-    let order = build_order(&models)?;
-    let rows: Vec<Value> = order
-        .iter()
-        .enumerate()
-        .map(|(pos, &i)| {
-            let m = &models[i];
-            json!({
-                "build_order": pos + 1,
-                "model": m.name,
-                "path": m.path,
-                "materialized": m.materialized.as_str(),
-                "relation": m.relation,
-                "depends_on": m.depends_on,
-                "sources": m.sources,
-            })
-        })
-        .collect();
-    Ok(Value::Array(rows).to_string())
-}
-
-/// `dbtindb_run([vars])`: builds every enabled model, in dependency order,
-/// and returns the statements it ran as a JSON array.
-///
-/// The build runs inside a savepoint: if any statement fails, everything it
-/// did is rolled back, and inside a caller's transaction it commits or rolls
-/// back with that transaction.
-fn dbtindb_run(call: &Call<'_>) -> Result<String, Error> {
-    if RUNNING.get() {
-        return Err(Error::new(
-            "dbtindb_run() cannot be called while it is running",
-        ));
-    }
-    let vars = vars(call.arg(0))?;
-    let db = call.db();
-    let _running = Running::enter();
-    db.exec("SAVEPOINT dbtindb_run").map_err(Error::new)?;
-    let built = build(db, &vars);
-    let end = match &built {
-        Ok(_) => db.exec("RELEASE dbtindb_run"),
-        Err(_) => db
-            .exec("ROLLBACK TO dbtindb_run")
-            .and_then(|()| db.exec("RELEASE dbtindb_run")),
-    };
-    // The build's own error matters more than a failure to end the
+    // The command's own error matters more than a failure to end the
     // savepoint after it.
-    let steps = built?;
+    let out = result?;
     end.map_err(Error::new)?;
-    Ok(Value::Array(steps).to_string())
+    Ok(out)
+}
+
+/// `dbtindb_ls([options])`: the selected nodes in build order, with lineage.
+fn ls(call: &Call<'_>) -> Result<String, Error> {
+    let inv = Invocation::parse(text_arg(call, 0, "options")?)?;
+    let (session, _) = load(call.db(), &inv)?;
+    let nodes = dbtindb_core::ls(&session, &inv.options)?;
+    Ok(serde_json::Value::Array(nodes.iter().map(|n| n.to_json()).collect()).to_string())
+}
+
+/// `dbtindb_compile(name [, options])`: a model's, snapshot's or test's SQL.
+fn compile(call: &Call<'_>) -> Result<String, Error> {
+    let name =
+        text_arg(call, 0, "name")?.ok_or_else(|| Error::new("dbtindb_compile needs a name"))?;
+    let inv = Invocation::parse(text_arg(call, 1, "options")?)?;
+    let (session, _) = load(call.db(), &inv)?;
+    dbtindb_core::compile(&session, name)
+}
+
+fn md5(call: &Call<'_>) -> Result<String, Error> {
+    let bytes = match call.arg(0) {
+        Arg::Text(t) => t,
+        _ => &[],
+    };
+    Ok(Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+fn load(raw: Db, inv: &Invocation) -> Result<(dbtindb_core::Session, Arc<SqliteDb>), Error> {
+    let db = Arc::new(SqliteDb::new(raw));
+    let (_, exists) = raw
+        .query(
+            "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'dbtindb_files'",
+            &[],
+        )
+        .map_err(Error::new)?;
+    if exists.is_empty() {
+        return Err(Error::new(format!(
+            "no dbtindb_files table to read the project from (create it with: {FILES_DDL})"
+        )));
+    }
+    let (_, rows) = raw
+        .query("SELECT path, source FROM main.dbtindb_files", &[])
+        .map_err(Error::new)?;
+    let files = rows
+        .into_iter()
+        .filter_map(|r| Some((r[0].as_str()?.to_owned(), r[1].as_str()?.to_owned())))
+        .collect();
+    let target = Target {
+        dialect: Dialect::Sqlite,
+        schema: "main".into(),
+    };
+    let session = dbtindb_core::load(files, &target, &inv.vars, db.clone())?;
+    Ok((session, db))
+}
+
+fn text_arg<'a>(call: &Call<'a>, i: usize, what: &str) -> Result<Option<&'a str>, Error> {
+    match call.arg(i) {
+        Arg::Null => Ok(None),
+        Arg::Text(t) => std::str::from_utf8(t)
+            .map(Some)
+            .map_err(|_| Error::new(format!("{what} is not valid UTF-8"))),
+        Arg::Other(kind) => Err(Error::new(format!("{what} must be text, not {kind}"))),
+    }
 }
 
 /// Holds [`RUNNING`] for as long as it lives, including through a panic.
 struct Running;
 
 impl Running {
-    fn enter() -> Self {
-        RUNNING.set(true);
-        Running
+    fn enter() -> Result<Self, Error> {
+        if RUNNING.replace(true) {
+            return Err(Error::new(
+                "a dbtindb command cannot run while another is running",
+            ));
+        }
+        Ok(Running)
     }
 }
 
@@ -163,140 +181,4 @@ impl Drop for Running {
     fn drop(&mut self) {
         RUNNING.set(false);
     }
-}
-
-fn build(db: Db, vars: &Value) -> Result<Vec<Value>, Error> {
-    db.exec(MANAGED_DDL).map_err(Error::new)?;
-    let models = compile_project(db, vars)?;
-    let order = build_order(&models)?;
-    let statements = plan(&models, &order, |m| existing(db, &m.name))?;
-
-    let mut steps = Vec::with_capacity(statements.len());
-    for (step, statement) in statements.iter().enumerate() {
-        db.exec(statement.sql())
-            .map_err(|e| Error::new(format!("{e}\nwhile running:\n{}", statement.sql())))?;
-        // The bookkeeping row moves in the same savepoint as the DDL, so
-        // dbtindb_managed always matches what actually exists.
-        let (model, action) = match statement {
-            Statement::Drop { model, .. } => {
-                db.query(
-                    "DELETE FROM main.dbtindb_managed WHERE relation_name = ?1",
-                    &[model],
-                )
-                .map_err(Error::new)?;
-                (model, "drop")
-            }
-            Statement::Create { model, .. } => {
-                let compiled = find(&models, model);
-                db.query(
-                    "INSERT INTO main.dbtindb_managed (relation_name, path, materialized) \
-                     VALUES (?1, ?2, ?3)",
-                    &[model, &compiled.path, compiled.materialized.as_str()],
-                )
-                .map_err(Error::new)?;
-                (model, "create")
-            }
-        };
-        steps.push(json!({
-            "step": step + 1,
-            "model": model,
-            "action": action,
-            "statement": statement.sql(),
-        }));
-    }
-    Ok(steps)
-}
-
-/// What exists in `main` under a model's name, and whether dbtindb made it.
-fn existing(db: Db, name: &str) -> Result<Option<Existing>, Error> {
-    let rows = db
-        .query(
-            "SELECT type FROM main.sqlite_master WHERE name = ?1 COLLATE NOCASE",
-            &[name],
-        )
-        .map_err(Error::new)?;
-    let Some(kind) = rows
-        .into_iter()
-        .next()
-        .and_then(|r| r.into_iter().next().flatten())
-    else {
-        return Ok(None);
-    };
-    let kind = match kind.as_str() {
-        "view" => ExistingKind::View,
-        "table" => ExistingKind::Table,
-        other => ExistingKind::Other(other.to_owned()),
-    };
-    let managed = !db
-        .query(
-            "SELECT 1 FROM main.dbtindb_managed WHERE relation_name = ?1",
-            &[name],
-        )
-        .map_err(Error::new)?
-        .is_empty();
-    Ok(Some(Existing { kind, managed }))
-}
-
-fn compile_project(db: Db, vars: &Value) -> Result<Vec<CompiledModel>, Error> {
-    let exists = !db
-        .query(
-            "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'jinja_templates'",
-            &[],
-        )
-        .map_err(Error::new)?
-        .is_empty();
-    if !exists {
-        return Err(Error::new(format!(
-            "no jinja_templates table to read models from (create it with: {TEMPLATES_DDL})"
-        )));
-    }
-    let files = db
-        .query("SELECT name, source FROM main.jinja_templates", &[])
-        .map_err(Error::new)?
-        .into_iter()
-        .filter_map(|row| {
-            let mut cols = row.into_iter();
-            Some((cols.next()??, cols.next()??))
-        });
-    let project = Project::new(files)?;
-    let target = Target {
-        dialect: Dialect::Sqlite,
-        schema: SCHEMA.to_owned(),
-    };
-    compile(&project, &target, vars)
-}
-
-/// The optional `vars` argument: a JSON object, or NULL for none.
-fn vars(arg: Arg<'_>) -> Result<Value, Error> {
-    match arg {
-        Arg::Null => Ok(json!({})),
-        Arg::Text(t) => match serde_json::from_slice(t) {
-            Ok(v @ Value::Object(_)) => Ok(v),
-            Ok(_) => Err(Error::new("vars must be a JSON object")),
-            Err(e) => Err(Error::new(format!("vars is not valid JSON: {e}"))),
-        },
-        other => Err(Error::new(format!(
-            "vars must be a JSON object, not {}",
-            type_name(other)
-        ))),
-    }
-}
-
-fn utf8(t: &[u8]) -> Result<&str, Error> {
-    std::str::from_utf8(t).map_err(|_| Error::new("argument is not valid UTF-8"))
-}
-
-fn type_name(arg: Arg<'_>) -> &'static str {
-    match arg {
-        Arg::Null => "null",
-        Arg::Text(_) => "text",
-        Arg::Other(name) => name,
-    }
-}
-
-fn find<'a>(models: &'a [CompiledModel], name: &str) -> &'a CompiledModel {
-    models
-        .iter()
-        .find(|m| m.name == name)
-        .expect("planned statements only name compiled models")
 }

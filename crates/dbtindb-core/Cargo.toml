@@ -1,6 +1,6 @@
 [package]
 name = "dbtindb-core"
-description = "Database-agnostic core of dbtindb: compiles Jinja SQL models with ref/source/config/var into an ordered build plan."
+description = "Database-agnostic core of dbtindb: dbt project parsing, selection, DAG ordering and materializations over a small Database trait."
 edition = "2024"
 version.workspace = true
 license.workspace = true
@@ -9,3 +9,6 @@ repository.workspace = true
 [dependencies]
 minijinja.workspace = true
 serde_json.workspace = true
+serde-saphyr.workspace = true
+csv.workspace = true
+md-5.workspace = true

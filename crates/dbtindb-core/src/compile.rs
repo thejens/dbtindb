@@ -1,474 +1,267 @@
-//! Rendering models with dbt's Jinja dialect and DAG functions.
+//! Compiling nodes for execution: rendering with `execute` true and the
+//! node's final config, then inlining the ephemeral models it refs.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeSet;
 
-use minijinja::value::{Kwargs, Rest};
-use minijinja::{Environment, ErrorKind, Value};
+use crate::node::{Node, NodeKind, TestTarget};
+use crate::session::Session;
+use crate::{Error, testgen};
 
-use crate::{Error, Project, Target};
-
-/// Per-render instruction budget, so a runaway macro cannot pin a database
-/// backend: rendering never returns control to the database until it ends.
-const FUEL: u64 = 50_000_000;
-
-/// How a model is built.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Materialization {
-    View,
-    Table,
-}
-
-impl Materialization {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Materialization::View => "view",
-            Materialization::Table => "table",
+impl Session {
+    /// The SQL a node compiles to: a model's or snapshot's SELECT, or a
+    /// test's query for failing rows. `is_incremental` is what the node's
+    /// `is_incremental()` returns.
+    pub fn compile(&self, unique_id: &str, is_incremental: bool) -> Result<String, Error> {
+        let mut seen = BTreeSet::new();
+        let (sql, ctes) = self.render_node(unique_id, is_incremental)?;
+        let mut defs = Vec::new();
+        for cte in ctes {
+            self.collect_cte(&cte, &mut seen, &mut defs)?;
         }
+        Ok(inject_ctes(&sql, &defs))
+    }
+
+    /// Renders a hook (or any SQL template) with `node` as the context.
+    pub fn render_hook(&self, unique_id: Option<&str>, hook: &str) -> Result<String, Error> {
+        match unique_id {
+            Some(id) => {
+                self.begin_execute(&self.manifest.nodes[id], false);
+                let out = self.render_str("<hook>", hook);
+                self.shared.finish();
+                out
+            }
+            None => {
+                self.shared.begin(
+                    true,
+                    "on-run hook",
+                    None,
+                    Default::default(),
+                    Default::default(),
+                );
+                let out = self.render_str("<hook>", hook);
+                self.shared.finish();
+                out
+            }
+        }
+        .map(|s| s.trim().to_owned())
+    }
+
+    fn begin_execute(&self, node: &Node, is_incremental: bool) {
+        self.shared.begin(
+            true,
+            &node.unique_id,
+            node.relation.clone(),
+            self.node_json(&node.unique_id),
+            node.config.clone(),
+        );
+        let mut cur = self.shared.current.lock().unwrap();
+        cur.is_incremental = is_incremental;
+        cur.parsed_refs = Some(node.depends_on.clone());
+    }
+
+    /// Renders a node, returning its SQL and the ephemeral models it refs.
+    fn render_node(
+        &self,
+        unique_id: &str,
+        is_incremental: bool,
+    ) -> Result<(String, Vec<String>), Error> {
+        let node = self
+            .manifest
+            .nodes
+            .get(unique_id)
+            .ok_or_else(|| Error::new(format!("no enabled node {unique_id}")))?;
+        self.begin_execute(node, is_incremental);
+        let rendered = match &node.kind {
+            NodeKind::Model(_) | NodeKind::SingularTest => self.render_file(&node.path),
+            NodeKind::Snapshot => self.call_macro(&format!("snapshot_{}", node.name), &[]),
+            NodeKind::GenericTest { target, .. } => {
+                let rel = match target {
+                    TestTarget::Node(id) => self.manifest.nodes[id]
+                        .relation
+                        .as_ref()
+                        .map(|r| r.rendered.clone())
+                        .unwrap_or_default(),
+                    TestTarget::Source(s, t) => {
+                        self.render_str("<source>", &format!("{{{{ source({s:?}, {t:?}) }}}}"))?
+                    }
+                };
+                // `where` narrows the tested relation, as dbt does.
+                let model = match node.config.str("where")? {
+                    Some(cond) => format!("(select * from {rel} where {cond}) dbt_subquery"),
+                    None => rel,
+                };
+                testgen::call_test(self, node, &model)
+            }
+            NodeKind::Seed => Err(Error::new(format!("{unique_id} is a seed; it has no SQL"))),
+        };
+        let cur = self.shared.finish();
+        let rendered = rendered.map_err(|e| Error::new(format!("compiling {}: {e}", node.path)))?;
+        Ok((trim_statement(&rendered), cur.ctes))
+    }
+
+    /// Adds `unique_id` (an ephemeral model) and the ephemerals it refs to
+    /// `defs`, dependencies first.
+    fn collect_cte(
+        &self,
+        unique_id: &str,
+        seen: &mut BTreeSet<String>,
+        defs: &mut Vec<(String, String)>,
+    ) -> Result<(), Error> {
+        if !seen.insert(unique_id.to_owned()) {
+            return Ok(());
+        }
+        let (sql, ctes) = self.render_node(unique_id, false)?;
+        for cte in ctes {
+            self.collect_cte(&cte, seen, defs)?;
+        }
+        let rel = self.manifest.nodes[unique_id]
+            .relation
+            .as_ref()
+            .expect("ephemerals have a CTE name");
+        defs.push((rel.rendered.clone(), sql));
+        Ok(())
     }
 }
 
-/// A model rendered to plain SQL, with everything its rendering revealed.
-#[derive(Clone, Debug)]
-pub struct CompiledModel {
-    pub name: String,
-    pub path: String,
-    /// The quoted relation the model is built as, which is also what
-    /// `ref()` to it renders to.
-    pub relation: String,
-    /// The model's SELECT, without a trailing semicolon.
-    pub sql: String,
-    pub materialized: Materialization,
-    /// Models this one `ref()`s.
-    pub depends_on: BTreeSet<String>,
-    /// Relations this one reads through `source()`.
-    pub sources: BTreeSet<String>,
+/// Puts ephemeral models in front of `sql` as CTEs, merging with a WITH
+/// clause the query already has, as dbt does.
+fn inject_ctes(sql: &str, defs: &[(String, String)]) -> String {
+    if defs.is_empty() {
+        return sql.to_owned();
+    }
+    let ctes: Vec<String> = defs
+        .iter()
+        .map(|(name, body)| format!("{name} as (\n{body}\n)"))
+        .collect();
+    let ctes = ctes.join(",\n");
+    match leading_with(sql) {
+        Some(after_with) => format!(
+            "{}\n{ctes},\n{}",
+            &sql[..after_with],
+            sql[after_with..].trim_start()
+        ),
+        None => format!("with {ctes}\n{sql}"),
+    }
 }
 
-/// What `ref`, `source` and `config` recorded during one model's render.
-#[derive(Default)]
-struct Recorder {
-    model: String,
-    refs: BTreeSet<String>,
-    sources: BTreeSet<String>,
-    materialized: Option<Materialization>,
-    enabled: Option<bool>,
-}
-
-/// `config()` keys that only carry metadata, accepted and ignored so dbt
-/// projects compile unchanged. Keys that would change where or how a model
-/// is built (schema, alias, unique_key, ...) are rejected instead, rather
-/// than silently building something different from what dbt would.
-const METADATA_CONFIG_KEYS: &[&str] = &[
-    "tags",
-    "meta",
-    "docs",
-    "description",
-    "persist_docs",
-    "group",
-    "access",
-];
-
-/// Compiles every enabled model of `project` for `target`.
-///
-/// `vars` is the object `var()` reads from. Models are returned in name
-/// order; use [`crate::build_order`] for dependency order.
-pub fn compile(
-    project: &Project,
-    target: &Target,
-    vars: &serde_json::Value,
-) -> Result<Vec<CompiledModel>, Error> {
-    let vars = match vars {
-        serde_json::Value::Null => serde_json::Map::new(),
-        serde_json::Value::Object(map) => map.clone(),
-        other => {
-            return Err(Error::new(format!(
-                "vars must be a JSON object, got {other}"
-            )));
+/// If `sql` starts with `WITH` (after whitespace and comments), the byte
+/// offset just after it, and after `RECURSIVE` if present.
+fn leading_with(sql: &str) -> Option<usize> {
+    let mut i = 0;
+    let bytes = sql.as_bytes();
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
+        if sql[i..].starts_with("--") {
+            i += sql[i..].find('\n').map_or(sql.len() - i, |n| n + 1);
+        } else if sql[i..].starts_with("/*") {
+            i += sql[i..].find("*/").map_or(sql.len() - i, |n| n + 2);
+        } else {
+            break;
+        }
+    }
+    let word = |at: usize, w: &str| {
+        sql.get(at..at + w.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(w))
+            && bytes
+                .get(at + w.len())
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
     };
-    let recorder = Arc::new(Mutex::new(Recorder::default()));
-    let mut env = environment(project, target, vars, recorder.clone());
-
-    let preamble = macro_preamble(&env, project)?;
-
-    let mut compiled = Vec::new();
-    let mut disabled = BTreeSet::new();
-    for model in project.models.values() {
-        let relation = target.dialect.relation(&target.schema, &model.name);
-        *recorder.lock().unwrap() = Recorder {
-            model: model.name.clone(),
-            ..Recorder::default()
-        };
-        env.add_global("this", Value::from(relation.clone()));
-        // The preamble goes on the model's first line so error line numbers
-        // still match the model's own source.
-        let source = format!("{preamble}{}", project.files[&model.path]);
-        env.add_template_owned(model.path.clone(), source, None)
-            .map_err(|e| model_error(&model.name, e))?;
-        let rendered = env
-            .get_template(&model.path)
-            .and_then(|t| t.render((), &[]))
-            .map_err(|e| model_error(&model.name, e))?;
-
-        let rec = std::mem::take(&mut *recorder.lock().unwrap());
-        if rec.enabled == Some(false) {
-            disabled.insert(model.name.clone());
-            continue;
-        }
-        compiled.push(CompiledModel {
-            name: model.name.clone(),
-            path: model.path.clone(),
-            relation,
-            sql: trim_statement(&rendered),
-            materialized: rec.materialized.unwrap_or(Materialization::View),
-            depends_on: rec.refs,
-            sources: rec.sources,
-        });
+    if !word(i, "with") {
+        return None;
     }
-
-    // dbt refuses to build a model that refs a disabled one.
-    for m in &compiled {
-        if let Some(d) = m.depends_on.iter().find(|d| disabled.contains(*d)) {
-            return Err(Error::new(format!(
-                "model {:?} refs {d:?}, which is disabled (config(enabled=false))",
-                m.name
-            )));
-        }
+    let mut end = i + 4;
+    let mut j = end;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
     }
-    Ok(compiled)
-}
-
-fn environment(
-    project: &Project,
-    target: &Target,
-    vars: serde_json::Map<String, serde_json::Value>,
-    recorder: Arc<Mutex<Recorder>>,
-) -> Environment<'static> {
-    let mut env = Environment::new();
-    env.set_fuel(Some(FUEL));
-
-    let files = Arc::new(project.files.clone());
-    env.set_loader(move |name| Ok(files.get(name).cloned()));
-
-    let models: Arc<BTreeSet<String>> = Arc::new(project.models.keys().cloned().collect());
-    let (dialect, schema) = (target.dialect, target.schema.clone());
-    let rec = recorder.clone();
-    env.add_function("ref", move |args: Rest<String>| {
-        let name = match args.0.as_slice() {
-            [name] => name,
-            [_, _] => {
-                return Err(jinja_error(
-                    "ref() with a package name is not supported: dbtindb projects have no packages",
-                ));
-            }
-            _ => return Err(jinja_error("ref() takes one argument: the model name")),
-        };
-        let mut rec = rec.lock().unwrap();
-        if !models.contains(name) {
-            return Err(jinja_error(format!(
-                "model {:?} refs {name:?}, which is not a model in this project",
-                rec.model
-            )));
-        }
-        rec.refs.insert(name.clone());
-        Ok(Value::from(dialect.relation(&schema, name)))
-    });
-
-    let rec = recorder.clone();
-    env.add_function("source", move |source_name: String, table_name: String| {
-        // Without dbt's sources.yml, the source name is the schema the
-        // table lives in.
-        let relation = dialect.relation(&source_name, &table_name);
-        rec.lock().unwrap().sources.insert(relation.clone());
-        Ok::<_, minijinja::Error>(Value::from(relation))
-    });
-
-    let rec = recorder.clone();
-    env.add_function("config", move |kwargs: Kwargs| {
-        let mut rec = rec.lock().unwrap();
-        for key in kwargs.args().map(str::to_owned).collect::<Vec<_>>() {
-            match key.as_str() {
-                "materialized" => {
-                    let m: String = kwargs.get(&key)?;
-                    rec.materialized = Some(match m.as_str() {
-                        "view" => Materialization::View,
-                        "table" => Materialization::Table,
-                        other => {
-                            return Err(jinja_error(format!(
-                                "materialized={other:?} is not supported by dbtindb (use \"view\" or \"table\")"
-                            )));
-                        }
-                    });
-                }
-                "enabled" => rec.enabled = Some(kwargs.get(&key)?),
-                k if METADATA_CONFIG_KEYS.contains(&k) => {
-                    let _: Value = kwargs.get(k)?;
-                }
-                other => {
-                    return Err(jinja_error(format!(
-                        "config key {other:?} is not supported by dbtindb"
-                    )));
-                }
-            }
-        }
-        Ok(Value::from(""))
-    });
-
-    let vars = Arc::new(vars);
-    env.add_function("var", move |name: String, default: Option<Value>| {
-        match (vars.get(&name), default) {
-            (Some(v), _) => Ok(Value::from_serialize(v)),
-            (None, Some(d)) => Ok(d),
-            (None, None) => Err(jinja_error(format!(
-                "required var {name:?} not found; pass it in the vars argument"
-            ))),
-        }
-    });
-
-    // dbtindb always rebuilds models from scratch, which is exactly how dbt
-    // treats an incremental model on a full refresh.
-    env.add_function("is_incremental", || Ok::<_, minijinja::Error>(false));
-
-    env.add_global(
-        "target",
-        Value::from_serialize(serde_json::json!({
-            "name": "dbtindb",
-            "type": target.dialect.name(),
-            "schema": target.schema,
-        })),
-    );
-    env
-}
-
-/// Builds the `{% from ... import ... %}` line that makes every macro in
-/// `macros/` callable from models without an import, as in dbt.
-fn macro_preamble(env: &Environment<'static>, project: &Project) -> Result<String, Error> {
-    let mut owner: BTreeMap<String, String> = BTreeMap::new();
-    let mut preamble = String::new();
-    for path in &project.macro_files {
-        let template = env.get_template(path)?;
-        let state = template
-            .eval_to_state((), &[])
-            .map_err(|e| Error::new(format!("loading macros from {path}: {e}")))?;
-        let mut names: Vec<&str> = state.exports();
-        names.sort_unstable();
-        if names.is_empty() {
-            continue;
-        }
-        for name in &names {
-            if let Some(other) = owner.insert(name.to_string(), path.clone()) {
-                return Err(Error::new(format!(
-                    "macro {name:?} is defined in both {other} and {path}"
-                )));
-            }
-        }
-        preamble.push_str(&format!(
-            "{{%- from {path:?} import {} -%}}",
-            names.join(", ")
-        ));
+    if word(j, "recursive") {
+        end = j + "recursive".len();
     }
-    Ok(preamble)
-}
-
-fn model_error(model: &str, e: minijinja::Error) -> Error {
-    Error::new(format!("compiling model {model:?}: {e}"))
-}
-
-fn jinja_error(msg: impl Into<String>) -> minijinja::Error {
-    minijinja::Error::new(ErrorKind::InvalidOperation, msg.into())
+    Some(end)
 }
 
 /// Trims whitespace and one trailing semicolon, so the SELECT can be
-/// wrapped in CREATE VIEW/TABLE ... AS.
-fn trim_statement(sql: &str) -> String {
+/// wrapped in CREATE ... AS or a subquery.
+pub fn trim_statement(sql: &str) -> String {
     let sql = sql.trim();
     sql.strip_suffix(';').unwrap_or(sql).trim_end().to_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::Dialect;
-
-    fn project(files: &[(&str, &str)]) -> Project {
-        Project::new(files.iter().map(|(p, s)| (p.to_string(), s.to_string()))).unwrap()
-    }
-
-    fn pg() -> Target {
-        Target {
-            dialect: Dialect::Postgres,
-            schema: "analytics".into(),
-        }
-    }
-
-    fn compile_ok(files: &[(&str, &str)]) -> BTreeMap<String, CompiledModel> {
-        compile(&project(files), &pg(), &serde_json::json!({}))
-            .unwrap()
-            .into_iter()
-            .map(|m| (m.name.clone(), m))
-            .collect()
-    }
+    use crate::parse_tests::load;
 
     #[test]
-    fn ref_and_source_resolve_and_are_recorded() {
-        let m = compile_ok(&[
-            (
-                "models/stg_orders.sql",
-                "select * from {{ source('raw', 'orders') }}",
-            ),
-            (
-                "models/orders.sql",
-                "select id from {{ ref('stg_orders') }};\n",
-            ),
-        ]);
-        assert_eq!(m["stg_orders"].sql, r#"select * from "raw"."orders""#);
+    fn inlines_ephemeral_models_as_ctes() {
+        let s = load(
+            &[
+                (
+                    "models/base.sql",
+                    "{{ config(materialized='ephemeral') }} select 1 as id",
+                ),
+                (
+                    "models/mid.sql",
+                    "{{ config(materialized='ephemeral') }} select * from {{ ref('base') }}",
+                ),
+                (
+                    "models/top.sql",
+                    "-- top\nWITH x AS (select * from {{ ref('mid') }}) select * from x;",
+                ),
+                ("models/plain.sql", "select * from {{ ref('base') }}"),
+            ],
+            Dialect::Postgres,
+        )
+        .unwrap();
         assert_eq!(
-            m["stg_orders"].sources,
-            BTreeSet::from([r#""raw"."orders""#.to_owned()])
+            s.compile("model.dbtindb.top", false).unwrap(),
+            "-- top\nWITH\n\"__dbt__cte__base\" as (\nselect 1 as id\n),\n\"__dbt__cte__mid\" as (\nselect * from \"__dbt__cte__base\"\n),\nx AS (select * from \"__dbt__cte__mid\") select * from x"
         );
         assert_eq!(
-            m["orders"].sql,
-            r#"select id from "analytics"."stg_orders""#
-        );
-        assert_eq!(
-            m["orders"].depends_on,
-            BTreeSet::from(["stg_orders".to_owned()])
-        );
-        assert_eq!(m["orders"].relation, r#""analytics"."orders""#);
-    }
-
-    #[test]
-    fn config_sets_materialization_and_defaults_to_view() {
-        let m = compile_ok(&[
-            (
-                "models/a.sql",
-                "{{ config(materialized='table', tags=['x']) }}select 1",
-            ),
-            ("models/b.sql", "select 2"),
-        ]);
-        assert_eq!(m["a"].materialized, Materialization::Table);
-        assert_eq!(m["a"].sql, "select 1");
-        assert_eq!(m["b"].materialized, Materialization::View);
-    }
-
-    #[test]
-    fn macros_are_global_and_dbt_blocks_parse() {
-        let m = compile_ok(&[
-            (
-                "macros/money.sql",
-                "{% macro cents_to_dollars(col) %}({{ col }} / 100.0){% endmacro %}\
-                 {% docs money %}Money helpers{% enddocs %}",
-            ),
-            (
-                "macros/util.sql",
-                "{% macro schema_of() %}{{ target.schema }}{% endmacro %}",
-            ),
-            (
-                "models/p.sql",
-                "select {{ cents_to_dollars('amount') }} from {{ this }} -- {{ schema_of() }}",
-            ),
-        ]);
-        assert_eq!(
-            m["p"].sql,
-            r#"select (amount / 100.0) from "analytics"."p" -- analytics"#
+            s.compile("model.dbtindb.plain", false).unwrap(),
+            "with \"__dbt__cte__base\" as (\nselect 1 as id\n)\nselect * from \"__dbt__cte__base\""
         );
     }
 
     #[test]
-    fn var_reads_vars_with_defaults() {
-        let p = project(&[("models/v.sql", "select {{ var('a') }}, {{ var('b', 7) }}")]);
-        let out = compile(&p, &pg(), &serde_json::json!({"a": 1})).unwrap();
-        assert_eq!(out[0].sql, "select 1, 7");
-        let err = compile(&p, &pg(), &serde_json::json!({})).unwrap_err();
-        assert!(err.0.contains("required var \"a\" not found"), "{err}");
+    fn execute_sees_final_config_and_is_incremental() {
+        let s = load(
+            &[(
+                "models/m.sql",
+                "{{ config(materialized='incremental', unique_key='id') }}select {{ config.get('unique_key') }}{% if is_incremental() %} from {{ this }}{% endif %}{% if execute %} -- run{% endif %}",
+            )],
+            Dialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(
+            s.compile("model.dbtindb.m", false).unwrap(),
+            "select id -- run"
+        );
+        assert_eq!(
+            s.compile("model.dbtindb.m", true).unwrap(),
+            "select id from \"analytics\".\"m\" -- run"
+        );
     }
 
     #[test]
-    fn is_incremental_is_false() {
-        let m = compile_ok(&[(
-            "models/i.sql",
-            "select 1{% if is_incremental() %} where false{% endif %}",
-        )]);
-        assert_eq!(m["i"].sql, "select 1");
-    }
-
-    #[test]
-    fn rejects_unknown_refs_and_unsupported_config() {
-        let p = project(&[("models/a.sql", "select * from {{ ref('nope') }}")]);
-        let err = compile(&p, &pg(), &serde_json::json!({})).unwrap_err();
+    fn generic_tests_compile_with_where() {
+        let s = load(
+            &[
+                ("models/m.sql", "select 1 as id"),
+                ("models/s.yml", "models:\n  - name: m\n    columns:\n      - name: id\n        tests:\n          - accepted_values:\n              values: [1, 2]\n              quote: false\n              config: {where: \"id > 0\"}\n"),
+            ],
+            Dialect::Postgres,
+        )
+        .unwrap();
+        let sql = s
+            .compile("test.dbtindb.accepted_values_m_id", false)
+            .unwrap();
         assert!(
-            err.0.contains("refs \"nope\", which is not a model"),
-            "{err}"
+            sql.contains("from (select * from \"analytics\".\"m\" where id > 0) dbt_subquery"),
+            "{sql}"
         );
-
-        let p = project(&[(
-            "models/a.sql",
-            "{{ config(materialized='incremental') }}select 1",
-        )]);
-        let err = compile(&p, &pg(), &serde_json::json!({})).unwrap_err();
-        assert!(
-            err.0
-                .contains("materialized=\"incremental\" is not supported"),
-            "{err}"
-        );
-
-        let p = project(&[("models/a.sql", "{{ config(schema='other') }}select 1")]);
-        let err = compile(&p, &pg(), &serde_json::json!({})).unwrap_err();
-        assert!(
-            err.0.contains("config key \"schema\" is not supported"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn disabled_models_are_skipped_but_cannot_be_referenced() {
-        let m = compile_ok(&[
-            ("models/off.sql", "{{ config(enabled=false) }}select 1"),
-            ("models/on.sql", "select 2"),
-        ]);
-        assert!(!m.contains_key("off") && m.contains_key("on"));
-
-        let p = project(&[
-            ("models/off.sql", "{{ config(enabled=false) }}select 1"),
-            ("models/on.sql", "select * from {{ ref('off') }}"),
-        ]);
-        let err = compile(&p, &pg(), &serde_json::json!({})).unwrap_err();
-        assert!(err.0.contains("which is disabled"), "{err}");
-    }
-
-    #[test]
-    fn duplicate_macros_are_rejected() {
-        let p = project(&[
-            ("macros/a.sql", "{% macro m() %}a{% endmacro %}"),
-            ("macros/b.sql", "{% macro m() %}b{% endmacro %}"),
-            ("models/x.sql", "select 1"),
-        ]);
-        let err = compile(&p, &pg(), &serde_json::json!({})).unwrap_err();
-        assert!(err.0.contains("macro \"m\" is defined in both"), "{err}");
-    }
-
-    #[test]
-    fn errors_point_at_the_model_line() {
-        let p = project(&[
-            ("macros/a.sql", "{% macro m() %}a{% endmacro %}"),
-            ("models/x.sql", "select 1\nfrom t\nwhere {{ oops( }}"),
-        ]);
-        let err = compile(&p, &pg(), &serde_json::json!({})).unwrap_err();
-        assert!(err.0.contains("models/x.sql:3"), "{err}");
-    }
-
-    #[test]
-    fn sqlite_relations_are_unqualified() {
-        let p = project(&[
-            ("models/a.sql", "select 1"),
-            ("models/b.sql", "select * from {{ ref('a') }}"),
-        ]);
-        let target = Target {
-            dialect: Dialect::Sqlite,
-            schema: "main".into(),
-        };
-        let out = compile(&p, &target, &serde_json::json!({})).unwrap();
-        assert_eq!(out[1].sql, r#"select * from "a""#);
+        assert!(sql.contains("not in (1, 2)"), "{sql}");
     }
 }

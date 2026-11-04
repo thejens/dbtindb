@@ -1,6 +1,6 @@
 [package]
 name = "sqlite_dbtindb"
-description = "dbtindb for SQLite: a loadable extension that builds dbt-style Jinja SQL models inside the database."
+description = "dbtindb for SQLite: a loadable extension that builds, tests and snapshots a dbt project inside the database."
 edition = "2024"
 version.workspace = true
 license.workspace = true
@@ -18,3 +18,4 @@ dbtindb-core = { path = "../dbtindb-core" }
 # sqlite-headers/README.md), which sets the minimum SQLite version.
 libsqlite3-sys = { version = "0.39.1", default-features = false, features = ["loadable_extension", "buildtime_bindgen"] }
 serde_json.workspace = true
+md-5.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "pg_dbtindb"
-description = "dbtindb for PostgreSQL: build dbt-style Jinja SQL models inside the database, on top of pgjinja."
+description = "dbtindb for PostgreSQL: build, test and snapshot a dbt project inside the database."
 edition = "2021"
 version.workspace = true
 license.workspace = true
