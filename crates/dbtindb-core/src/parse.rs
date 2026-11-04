@@ -8,7 +8,7 @@ use minijinja::Value;
 use crate::config::Config;
 use crate::context::{Current, RefTarget, Relation};
 use crate::node::{Manifest, Materialized, Node, NodeKind, ResourceType};
-use crate::project::{NodeFile, ResourceProps};
+use crate::project::{ColumnProps, NodeFile, ResourceProps};
 use crate::session::Session;
 use crate::{Error, testgen};
 
@@ -53,6 +53,9 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
     {
         let mut names = session.shared.names.write().unwrap();
         for (rt, name, file) in &declared {
+            if *rt == ResourceType::Analysis {
+                continue;
+            }
             let unique_id = format!("{}.{project_name}.{name}", rt.as_str());
             let target = RefTarget {
                 unique_id,
@@ -71,10 +74,17 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
         }
     }
 
+    // Analyses can ref models but are not ref()able themselves.
+    declared.extend(
+        p.analyses
+            .values()
+            .map(|f| (ResourceType::Analysis, f.name.clone(), f.clone())),
+    );
     for (rt, name, file) in &declared {
         let props = match rt {
             ResourceType::Model => p.properties.models.get(name),
             ResourceType::Seed => p.properties.seeds.get(name),
+            ResourceType::Analysis => p.properties.analyses.get(name),
             _ => p.properties.snapshots.get(name),
         }
         .cloned()
@@ -134,12 +144,12 @@ fn parse_node(
     let mut fqn = vec![project_name.clone()];
     fqn.extend(file.dirs.iter().cloned());
     fqn.push(name.to_owned());
-    let tree = match rt {
-        ResourceType::Model => &settings.models,
-        ResourceType::Seed => &settings.seeds,
-        _ => &settings.snapshots,
+    let mut config = match rt {
+        ResourceType::Model => Config::from_project(&settings.models, &fqn),
+        ResourceType::Seed => Config::from_project(&settings.seeds, &fqn),
+        ResourceType::Snapshot => Config::from_project(&settings.snapshots, &fqn),
+        _ => Config::default(),
     };
-    let mut config = Config::from_project(tree, &fqn);
     config.merge(&props.config);
     let unique_id = format!("{}.{project_name}.{name}", rt.as_str());
     let mut node = Node {
@@ -153,15 +163,24 @@ fn parse_node(
         relation: None,
         depends_on: BTreeSet::new(),
         sources: BTreeSet::new(),
-        description: props.description.clone(),
-        columns: props.columns.clone(),
+        description: render_description(session, &file.path, &props.description)?,
+        columns: props
+            .columns
+            .iter()
+            .map(|c| {
+                Ok(ColumnProps {
+                    description: render_description(session, &file.path, &c.description)?,
+                    ..c.clone()
+                })
+            })
+            .collect::<Result<_, Error>>()?,
     };
     if rt == ResourceType::Seed {
         return Ok(node);
     }
 
     let rendered = render_for_parse(session, &node, |s| match rt {
-        ResourceType::Model => s.render_file(&node.path).map(|_| ()),
+        ResourceType::Model | ResourceType::Analysis => s.render_file(&node.path).map(|_| ()),
         _ => s.call_macro(&format!("snapshot_{name}"), &[]).map(|_| ()),
     });
     let cur = rendered.map_err(|e| Error::new(format!("parsing {}: {e}", node.path)))?;
@@ -179,6 +198,7 @@ fn parse_node(
                 ))
             })?)
         }
+        ResourceType::Analysis => NodeKind::Analysis,
         _ => NodeKind::Snapshot,
     };
     if node.config.get("database").is_some() {
@@ -188,6 +208,17 @@ fn parse_node(
         )));
     }
     Ok(node)
+}
+
+/// A description as dbt shows it: rendered, so `{{ doc('orders') }}`
+/// becomes the docs block's text.
+fn render_description(session: &Session, path: &str, text: &str) -> Result<String, Error> {
+    if !text.contains("{{") && !text.contains("{%") {
+        return Ok(text.to_owned());
+    }
+    session
+        .render_str("<description>", text)
+        .map_err(|e| Error::new(format!("{path}: rendering a description: {e}")))
 }
 
 /// Renders with `execute` false and returns what the render recorded.
@@ -218,6 +249,9 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
     let shared = session.shared.clone();
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     for node in nodes.values_mut() {
+        if node.resource_type == ResourceType::Analysis {
+            continue;
+        }
         if node.materialized() == Some(Materialized::Ephemeral) {
             node.relation = Some(Relation::cte(shared.dialect, &node.name));
             let mut names = shared.names.write().unwrap();
@@ -296,6 +330,7 @@ fn check_unknown_properties(
         (ResourceType::Model, &p.models),
         (ResourceType::Seed, &p.seeds),
         (ResourceType::Snapshot, &p.snapshots),
+        (ResourceType::Analysis, &p.analyses),
     ] {
         for (name, props) in entries {
             let id = format!("{}.{}.{name}", rt.as_str(), session.shared.project_name);

@@ -64,6 +64,7 @@ impl Session {
             sources: project.properties.sources.clone(),
             dispatch: project.settings.dispatch.clone(),
             packages: project.packages.keys().cloned().collect(),
+            docs: project.docs.clone(),
             flags: Mutex::new(InvocationFlags::default()),
             current: Mutex::new(Current::default()),
         });

@@ -50,7 +50,8 @@ impl Command {
             Command::Seed => rt == ResourceType::Seed,
             Command::Snapshot => rt == ResourceType::Snapshot,
             Command::Test => rt == ResourceType::Test,
-            Command::Build => true,
+            // Analyses are only ever compiled.
+            Command::Build => rt != ResourceType::Analysis,
         }
     }
 }
@@ -316,6 +317,7 @@ impl Runner<'_> {
                 }
                 ("test".to_owned(), r.status, Some(r.failures))
             }
+            NodeKind::Analysis => unreachable!("no command runs analyses"),
             NodeKind::Snapshot => {
                 let (action, stmts) = snapshot::build(self, node, plan)?;
                 sql.extend(stmts);

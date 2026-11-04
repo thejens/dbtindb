@@ -13,6 +13,7 @@ pub struct Properties {
     pub models: BTreeMap<String, ResourceProps>,
     pub seeds: BTreeMap<String, ResourceProps>,
     pub snapshots: BTreeMap<String, ResourceProps>,
+    pub analyses: BTreeMap<String, ResourceProps>,
     pub sources: BTreeMap<(String, String), SourceTable>,
 }
 
@@ -72,6 +73,7 @@ impl Properties {
             ("models", &mut self.models),
             ("seeds", &mut self.seeds),
             ("snapshots", &mut self.snapshots),
+            ("analyses", &mut self.analyses),
         ] {
             for entry in list(doc.get(key), &ctx(key))? {
                 let props = resource(path, entry)?;

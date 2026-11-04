@@ -15,6 +15,7 @@ pub enum ResourceType {
     Seed,
     Snapshot,
     Test,
+    Analysis,
 }
 
 impl ResourceType {
@@ -24,6 +25,7 @@ impl ResourceType {
             ResourceType::Seed => "seed",
             ResourceType::Snapshot => "snapshot",
             ResourceType::Test => "test",
+            ResourceType::Analysis => "analysis",
         }
     }
 }
@@ -75,6 +77,8 @@ pub enum NodeKind {
     /// A `{% snapshot %}` block, called as the macro `snapshot_<name>`.
     Snapshot,
     SingularTest,
+    /// An analysis: compiled, never run.
+    Analysis,
     GenericTest {
         /// The test macro: `test_<name>`.
         macro_name: String,
@@ -96,7 +100,7 @@ pub struct Node {
     pub fqn: Vec<String>,
     pub config: Config,
     pub kind: NodeKind,
-    /// The relation the node builds; `None` for tests and ephemeral models.
+    /// The relation the node builds; `None` for tests and analyses.
     pub relation: Option<Relation>,
     /// Unique ids of the nodes it depends on.
     pub depends_on: BTreeSet<String>,

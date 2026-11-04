@@ -101,6 +101,8 @@ pub struct Shared {
     pub dispatch: BTreeMap<String, Vec<String>>,
     /// The installed packages' names.
     pub packages: BTreeSet<String>,
+    /// `{% docs %}` blocks, for `doc()`.
+    pub docs: BTreeMap<String, String>,
     pub flags: Mutex<InvocationFlags>,
     pub current: Mutex<Current>,
 }
@@ -249,9 +251,10 @@ pub fn environment(
     env.add_global("run_started_at", functions::run_started_at());
     env.add_global("invocation_id", functions::invocation_id());
 
-    let functions: [(&'static str, Impl); 12] = [
+    let functions: [(&'static str, Impl); 13] = [
         ("ref", ref_fn),
         ("source", source_fn),
+        ("doc", doc_fn),
         ("var", var_fn),
         ("env_var", env_var_fn),
         ("is_incremental", |s, _, _| {
@@ -391,6 +394,27 @@ fn source_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error
     };
     s.current.lock().unwrap().sources.insert(key);
     Ok(s.relation(&schema, &identifier).into_value())
+}
+
+/// `doc('name')`, or `doc('<project>', 'name')`: a docs block's text.
+fn doc_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    let name = match a.positional {
+        [name] => name,
+        [package, name] if package.as_str() == Some(s.project_name.as_str()) => name,
+        [package, _] => {
+            return Err(jinja_error(format!(
+                "doc(): docs blocks of package {package} are not loaded; only this project's are"
+            )));
+        }
+        _ => return Err(jinja_error("doc() takes the name of a docs block")),
+    };
+    let name = name
+        .as_str()
+        .ok_or_else(|| jinja_error("doc(): the name must be a string"))?;
+    s.docs
+        .get(name)
+        .map(|text| Value::from(text.as_str()))
+        .ok_or_else(|| jinja_error(format!("doc(): there is no docs block named {name:?}")))
 }
 
 fn var_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {

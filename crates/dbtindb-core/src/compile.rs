@@ -95,7 +95,9 @@ impl Session {
             .ok_or_else(|| Error::new(format!("no enabled node {unique_id}")))?;
         self.begin_execute(node, is_incremental);
         let rendered = match &node.kind {
-            NodeKind::Model(_) | NodeKind::SingularTest => self.render_file(&node.path),
+            NodeKind::Model(_) | NodeKind::SingularTest | NodeKind::Analysis => {
+                self.render_file(&node.path)
+            }
             NodeKind::Snapshot => self.call_macro(&format!("snapshot_{}", node.name), &[]),
             NodeKind::GenericTest { target, .. } => {
                 testgen::tested_relation(self, &self.manifest.nodes, target)

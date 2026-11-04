@@ -13,9 +13,10 @@ pub struct File {
     pub source: String,
 }
 
-/// What dbtindb reads under the project's paths; everything else (docs,
-/// `target/`, editor files) stays out of the database.
-const EXTENSIONS: &[&str] = &["sql", "yml", "yaml", "csv"];
+/// What dbtindb reads under the project's paths (`.md` for `{% docs %}`
+/// blocks); everything else (`target/`, editor files) stays out of the
+/// database.
+const EXTENSIONS: &[&str] = &["sql", "yml", "yaml", "csv", "md"];
 
 /// Files dbt would use but dbtindb cannot, reported as warnings.
 const UNSUPPORTED: &[(&str, &str)] = &[(
@@ -89,12 +90,15 @@ fn add_project(dir: &Path, rel: &str, files: &mut Vec<File>) -> Result<Settings,
         path: prefix(PROJECT_FILE),
         source: text,
     });
+    let docs = settings.docs_roots();
     let mut dirs: Vec<&String> = [
         &settings.model_paths,
         &settings.seed_paths,
         &settings.snapshot_paths,
         &settings.test_paths,
         &settings.macro_paths,
+        &settings.analysis_paths,
+        &docs,
     ]
     .into_iter()
     .flatten()
@@ -201,6 +205,7 @@ mod tests {
             [
                 "dbt_project.yml",
                 "lib/m.sql",
+                "models/docs.md",
                 "models/schema.yml",
                 "models/staging/a.sql",
                 "seeds/c.csv"

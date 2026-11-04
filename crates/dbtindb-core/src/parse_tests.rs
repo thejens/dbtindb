@@ -211,3 +211,69 @@ fn disabled_nodes_are_dropped_and_cannot_be_referenced() {
     .unwrap();
     assert!(err.0.contains("disabled"), "{err}");
 }
+
+#[test]
+fn analyses_compile_but_are_not_referenceable() {
+    let s = load(
+        &[
+            ("models/a.sql", "select 1 as id"),
+            ("analyses/report.sql", "select count(*) from {{ ref('a') }}"),
+        ],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let report = &s.manifest.nodes["analysis.dbtindb.report"];
+    assert_eq!(report.resource_type, ResourceType::Analysis);
+    assert!(report.relation.is_none());
+    assert!(report.depends_on.contains("model.dbtindb.a"));
+    assert_eq!(
+        crate::compile(&s, "report").unwrap(),
+        "select count(*) from \"analytics\".\"a\""
+    );
+    let err = load(
+        &[
+            ("analyses/report.sql", "select 1"),
+            ("models/b.sql", "select * from {{ ref('report') }}"),
+        ],
+        Dialect::Postgres,
+    )
+    .err()
+    .unwrap();
+    assert!(err.0.contains("report"), "{err}");
+}
+
+#[test]
+fn descriptions_render_docs_blocks() {
+    let s = load(
+        &[
+            ("models/orders.sql", "select 1 as id"),
+            (
+                "models/orders.yml",
+                "version: 2\nmodels:\n  - name: orders\n    description: \"{{ doc('orders') }}\"\n    \
+                 columns:\n      - name: id\n        description: \"{{ doc('dbtindb', 'order_id') }}\"\n",
+            ),
+            (
+                "models/docs.md",
+                "{% docs orders %}\nOne row per {order}.\n{% enddocs %}\n{% docs order_id %}The key.{% enddocs %}",
+            ),
+        ],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let orders = &s.manifest.nodes["model.dbtindb.orders"];
+    assert_eq!(orders.description, "One row per {order}.");
+    assert_eq!(orders.columns[0].description, "The key.");
+    let err = load(
+        &[
+            ("models/a.sql", "select 1"),
+            (
+                "models/a.yml",
+                "version: 2\nmodels:\n  - name: a\n    description: \"{{ doc('nope') }}\"\n",
+            ),
+        ],
+        Dialect::Postgres,
+    )
+    .err()
+    .unwrap();
+    assert!(err.0.contains("no docs block named \"nope\""), "{err}");
+}
