@@ -387,6 +387,25 @@ from src
         statuses = {s["name"]: (s["status"], s["failures"]) for s in call(conn, "dbtindb_test")["steps"]}
         self.assertEqual(statuses, {"is_even_m_n": ("warn", 1), "no_threes": ("fail", 1)})
 
+    def test_store_failures_docs_and_analyses(self):
+        conn = connect()
+        put(conn, {
+            "dbt_project.yml": "name: shop\nmodels:\n  +materialized: table\n",
+            "models/m.sql": "select 2 as n union all select 3",
+            "models/m.yml": "models:\n  - name: m\n    description: \"{{ doc('m') }}\"\n    columns:\n      - name: n\n"
+                            "        tests:\n          - accepted_values:\n              values: [2]\n              quote: false\n"
+                            "              config: {store_failures: true}\n",
+            "models/docs.md": "{% docs m %}Numbers.{% enddocs %}",
+            "analyses/odd.sql": "select n from {{ ref('m') }} where n % 2 = 1",
+        })
+        call(conn, "dbtindb_run")
+        self.assertEqual(steps(call(conn, "dbtindb_test")), [("accepted_values_m_n", "test", "fail")])
+        self.assertEqual(conn.execute("SELECT * FROM accepted_values_m_n").fetchall(), [(3, 1)])
+        (compiled,) = conn.execute("SELECT dbtindb_compile('odd')").fetchone()
+        self.assertEqual(compiled, 'select n from "m" where n % 2 = 1')
+        # Analyses are compiled, never built.
+        self.assertEqual(objects(conn), [("table", "accepted_values_m_n"), ("table", "m")])
+
 
 class SafetyTest(unittest.TestCase):
     def test_never_replaces_relations_it_did_not_create(self):
@@ -420,7 +439,7 @@ class SafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(sqlite3.OperationalError, "no dbtindb_files table"):
             conn.execute("SELECT dbtindb_ls()").fetchone()
         conn = shop()
-        with self.assertRaisesRegex(sqlite3.OperationalError, 'no enabled model, snapshot or test named "nope"'):
+        with self.assertRaisesRegex(sqlite3.OperationalError, 'no enabled model, snapshot, test or analysis named "nope"'):
             conn.execute("SELECT dbtindb_compile('nope')").fetchone()
         with self.assertRaisesRegex(sqlite3.OperationalError, "unknown option"):
             call(conn, "dbtindb_ls", '{"selec": "x"}')

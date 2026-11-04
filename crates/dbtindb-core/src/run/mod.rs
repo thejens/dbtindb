@@ -89,8 +89,12 @@ enum Plan {
     /// Build into the existing relation: incremental, snapshot, seed reload
     /// or materialized view refresh.
     Update,
-    /// Tests: no relation.
+    /// Tests that keep no failing rows: no relation.
     Query,
+    /// A view of a test's failing rows on top of a replaced relation:
+    /// dropped so that the drop goes through, and made again the next
+    /// time the test runs.
+    Drop,
 }
 
 pub fn execute(session: &Session, command: Command, options: &Options) -> Result<Vec<Step>, Error> {
@@ -140,13 +144,14 @@ impl Runner<'_> {
             self.hook(None, hook, "on-run-start")?;
         }
         for id in order.iter().rev() {
-            if plans.get(id) == Some(&Plan::Replace) {
+            if let Some(Plan::Replace | Plan::Drop) = plans.get(id) {
                 self.drop(&m.nodes[id])?;
             }
         }
         for id in &order {
-            if let Some(&plan) = plans.get(id) {
-                self.build(&m.nodes[id], plan, command)?;
+            match plans.get(id) {
+                None | Some(Plan::Drop) => {}
+                Some(&plan) => self.build(&m.nodes[id], plan, command)?,
             }
         }
         for hook in &m.on_run_end {
@@ -247,6 +252,17 @@ impl Runner<'_> {
                         {
                             plans.insert(child.to_owned(), Plan::Replace);
                             work.push(child.to_owned());
+                        }
+                    }
+                    _ if node.stored_failures()? == Some(Materialized::View)
+                        && !plans.contains_key(child) =>
+                    {
+                        let rel = node
+                            .relation
+                            .as_ref()
+                            .expect("stored failures have relations");
+                        if self.existing(node, rel)?.is_some() {
+                            plans.insert(child.to_owned(), Plan::Drop);
                         }
                     }
                     _ => {}
@@ -385,9 +401,9 @@ impl Runner<'_> {
     }
 }
 
-/// Identifies a compiled query, to tell whether a materialized view's
-/// definition changed.
-fn checksum(sql: &str) -> String {
+/// The hex MD5 of `text`: identifies a compiled query, to tell whether a
+/// materialized view's definition changed, and shortens long test names.
+pub(crate) fn checksum(sql: &str) -> String {
     Md5::digest(sql.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))

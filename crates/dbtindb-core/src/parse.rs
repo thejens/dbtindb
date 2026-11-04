@@ -125,6 +125,8 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
             unreachable!("test names are made unique");
         }
     }
+    // Tests that store their failures are named only now.
+    resolve_relations(session, &mut nodes)?;
     Ok(Manifest {
         nodes,
         on_run_start: session.project.settings.on_run_start.clone(),
@@ -249,7 +251,18 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
     let shared = session.shared.clone();
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     for node in nodes.values_mut() {
-        if node.resource_type == ResourceType::Analysis {
+        if let Some(rel) = &node.relation {
+            if node.materialized() != Some(Materialized::Ephemeral) {
+                seen.insert(
+                    (rel.schema.clone(), rel.identifier.clone()),
+                    node.unique_id.clone(),
+                );
+            }
+            continue;
+        }
+        if node.resource_type == ResourceType::Analysis
+            || (node.is_test() && node.stored_failures()?.is_none())
+        {
             continue;
         }
         if node.materialized() == Some(Materialized::Ephemeral) {
@@ -261,11 +274,15 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
             continue;
         }
         let node_value = Value::from_serialize(node.to_json(&shared.project_name));
-        let custom_schema = node
-            .config
-            .str("schema")?
-            .map(Value::from)
-            .unwrap_or(Value::from(()));
+        let custom_schema = match node.config.str("schema")? {
+            Some(s) => Value::from(s),
+            // dbt keeps failing rows in `<target schema>_dbt_test__audit`;
+            // SQLite has only the one schema.
+            None if node.is_test() && shared.dialect.has_schemas() => {
+                Value::from("dbt_test__audit")
+            }
+            None => Value::from(()),
+        };
         let custom_alias = node
             .config
             .str("alias")?
@@ -279,10 +296,17 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
                 .trim()
                 .to_owned(),
         };
-        let alias = session
+        let mut alias = session
             .call_macro("generate_alias_name", &[custom_alias, node_value])?
             .trim()
             .to_owned();
+        // Generic test names grow with their arguments; dbt shortens long
+        // ones the same way.
+        if node.is_test() && alias.len() >= 64 {
+            let hash = crate::run::checksum(&alias);
+            let head: String = alias.chars().take(30).collect();
+            alias = format!("{head}_{hash}");
+        }
         if !shared.dialect.has_schemas() && schema != shared.target_schema {
             return Err(Error::new(format!(
                 "{}: SQLite has no schemas, so {} cannot be built in schema {schema:?}; remove its schema config",
@@ -309,9 +333,11 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
             )));
         }
         let relation = shared.relation(&schema, &alias);
-        let mut names = shared.names.write().unwrap();
-        if let Some(t) = names.get_mut(&node.name) {
-            t.relation = relation.clone();
+        if !node.is_test() {
+            let mut names = shared.names.write().unwrap();
+            if let Some(t) = names.get_mut(&node.name) {
+                t.relation = relation.clone();
+            }
         }
         node.relation = Some(relation);
     }

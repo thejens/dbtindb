@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
-use crate::Config;
 use crate::context::Relation;
 use crate::project::ColumnProps;
+use crate::{Config, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResourceType {
@@ -114,6 +114,28 @@ impl Node {
         match self.kind {
             NodeKind::Model(m) => Some(m),
             _ => None,
+        }
+    }
+
+    /// Where a test keeps its failing rows (`store_failures`,
+    /// `store_failures_as`): a table, a view, or nowhere.
+    pub fn stored_failures(&self) -> Result<Option<Materialized>, Error> {
+        if !self.is_test() {
+            return Ok(None);
+        }
+        match self.config.str("store_failures_as")? {
+            Some("table") => Ok(Some(Materialized::Table)),
+            Some("view") => Ok(Some(Materialized::View)),
+            Some("ephemeral") => Ok(None),
+            Some(other) => Err(Error::new(format!(
+                "{}: store_failures_as must be table, view or ephemeral, not {other:?}",
+                self.path
+            ))),
+            None => Ok(self
+                .config
+                .bool("store_failures")?
+                .unwrap_or(false)
+                .then_some(Materialized::Table)),
         }
     }
 

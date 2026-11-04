@@ -1,13 +1,15 @@
 //! Running data tests as dbt does: `fail_calc` (by default the number of
 //! rows) over the test query, cut to `limit` rows, then `severity`,
-//! `warn_if` and `error_if`.
+//! `warn_if` and `error_if`. With `store_failures`, the failing rows are
+//! kept in a table or view first, and counted from there.
 
 use serde_json::Value;
 
 use crate::Error;
-use crate::node::Node;
+use crate::node::{Materialized, Node};
 
 use super::Runner;
+use super::materialize::run as exec;
 
 pub struct Outcome {
     pub status: String,
@@ -29,7 +31,25 @@ pub fn run(r: &Runner<'_>, node: &Node) -> Result<Outcome, Error> {
             )));
         }
     };
-    let count = format!("SELECT {fail_calc} AS failures FROM (\n{sql}{limit}\n) dbt_internal_test");
+    let mut stmts = Vec::new();
+    let failing = match (node.stored_failures()?, &node.relation) {
+        (Some(m), Some(rel)) => {
+            let keyword = if m == Materialized::View {
+                "VIEW"
+            } else {
+                "TABLE"
+            };
+            stmts.push(exec(
+                r,
+                format!("CREATE {keyword} {} AS\n{sql}", rel.rendered),
+            )?);
+            r.managed.record(rel, &node.unique_id, m.as_str(), None)?;
+            format!("SELECT * FROM {}", rel.rendered)
+        }
+        _ => sql,
+    };
+    let count =
+        format!("SELECT {fail_calc} AS failures FROM (\n{failing}{limit}\n) dbt_internal_test");
     let table =
         r.db.query(&count)
             .map_err(|e| Error::new(format!("{e}\nwhile running test {}:\n{count}", node.name)))?;
@@ -61,10 +81,11 @@ pub fn run(r: &Runner<'_>, node: &Node) -> Result<Outcome, Error> {
             )));
         }
     };
+    stmts.push(count);
     Ok(Outcome {
         status: status.into(),
         failures,
-        sql: count,
+        sql: stmts.join(";\n"),
     })
 }
 

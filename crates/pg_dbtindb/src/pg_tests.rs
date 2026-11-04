@@ -285,6 +285,51 @@ mod tests {
     }
 
     #[pg_test]
+    fn tests_store_their_failing_rows() {
+        Spi::run("CREATE TABLE src (id int); INSERT INTO src VALUES (1), (1), (2), (NULL)")
+            .unwrap();
+        file(
+            "dbt_project.yml",
+            "name: shop\nmodels:\n  +materialized: table\ndata_tests:\n  +store_failures: true\n",
+        );
+        file("models/m.sql", "select * from src");
+        file(
+            "models/schema.yml",
+            "models:\n  - name: m\n    columns:\n      - name: id\n        data_tests:\n          \
+             - unique\n          - not_null: {config: {store_failures_as: view}}\n",
+        );
+        Spi::run("SELECT * FROM dbtindb_run()").unwrap();
+        assert_eq!(
+            text("SELECT string_agg(name || ':' || status, ',' ORDER BY name) FROM dbtindb_test()"),
+            "not_null_m_id:fail,unique_m_id:fail"
+        );
+        assert_eq!(
+            count("SELECT n_records FROM public_dbt_test__audit.unique_m_id"),
+            2
+        );
+        assert_eq!(
+            text("SELECT relkind::text FROM pg_class WHERE relname = 'not_null_m_id'"),
+            "v"
+        );
+        // The failing-rows view would block rebuilding m; it goes, and
+        // comes back with the next test run.
+        Spi::run("DELETE FROM src WHERE id IS NULL").unwrap();
+        Spi::run("SELECT * FROM dbtindb_run()").unwrap();
+        assert_eq!(
+            count("SELECT count(*) FROM pg_class WHERE relname = 'not_null_m_id'"),
+            0
+        );
+        assert_eq!(
+            text("SELECT status FROM dbtindb_test() WHERE name = 'not_null_m_id'"),
+            "pass"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM public_dbt_test__audit.not_null_m_id"),
+            0
+        );
+    }
+
+    #[pg_test]
     fn refreshes_materialized_views_until_their_query_changes() {
         Spi::run("CREATE TABLE src (id int); INSERT INTO src VALUES (1)").unwrap();
         file(

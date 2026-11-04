@@ -277,3 +277,55 @@ fn descriptions_render_docs_blocks() {
     .unwrap();
     assert!(err.0.contains("no docs block named \"nope\""), "{err}");
 }
+
+#[test]
+fn tests_that_store_failures_get_audit_relations() {
+    let files = [
+        (
+            "dbt_project.yml",
+            "name: dbtindb\ndata_tests:\n  +store_failures: true\n",
+        ),
+        ("models/orders.sql", "select 1 as id"),
+        (
+            "models/orders.yml",
+            "models:\n  - name: orders\n    columns:\n      - name: id\n        data_tests:\n          - unique\n          \
+             - not_null:\n              config: {store_failures_as: ephemeral}\n      \
+             - name: a_column_whose_name_goes_on_and_on_and_on_and_on\n        data_tests:\n          \
+             - accepted_values:\n              values: [1]\n              config: {store_failures_as: view}\n",
+        ),
+    ];
+    let s = load(&files, Dialect::Postgres).unwrap();
+    let rel = |name: &str| {
+        s.manifest
+            .nodes
+            .values()
+            .find(|n| n.name.starts_with(name))
+            .unwrap()
+            .relation
+            .as_ref()
+            .map(|r| r.rendered.clone())
+    };
+    assert_eq!(
+        rel("unique_").as_deref(),
+        Some("\"analytics_dbt_test__audit\".\"unique_orders_id\"")
+    );
+    // accepted_values_orders_a_column_whose_name_goes_on_and_on_and_on_and_on
+    // is too long for an identifier.
+    assert_eq!(
+        rel("accepted_values_").as_deref(),
+        Some(
+            "\"analytics_dbt_test__audit\".\"accepted_values_orders_a_colum_\
+             43968c4bda22a788e4bb2b89d4ef1be8\""
+        )
+    );
+    assert_eq!(rel("not_null_"), None);
+    let s = load(&files, Dialect::Sqlite).unwrap();
+    assert_eq!(
+        s.manifest.nodes["test.dbtindb.unique_orders_id"]
+            .relation
+            .as_ref()
+            .unwrap()
+            .rendered,
+        "\"unique_orders_id\""
+    );
+}
