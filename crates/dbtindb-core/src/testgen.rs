@@ -136,10 +136,16 @@ fn generic(
     p: &Pending<'_>,
     used: &mut BTreeSet<String>,
 ) -> Result<Node, Error> {
-    let macro_name = format!("test_{}", p.def.test);
+    // `dbt_utils.at_least_one` is the `{% test at_least_one %}` block of
+    // the dbt_utils package; a bare name is looked up as any macro is.
+    let macro_name = match p.def.test.split_once('.') {
+        Some((package, test)) => format!("{package}.test_{test}"),
+        None => format!("test_{}", p.def.test),
+    };
     if !session.has_macro(&macro_name) {
         return Err(Error::new(format!(
-            "{}: there is no generic test named {:?}; define it with {{% test {} %}} in macros/ or tests/generic/",
+            "{}: there is no generic test named {:?}; define it with {{% test {} %}} in macros/ or tests/generic/, \
+             or install the package that provides it",
             p.file, p.def.test, p.def.test
         )));
     }
@@ -190,22 +196,19 @@ fn generic(
         column: p.column.clone(),
     };
     let mut node = test_node(session, &name, p.file, fqn, config, kind);
-    let model = match &p.target {
+    match &p.target {
         TestTarget::Node(uid) => {
             node.depends_on.insert(uid.clone());
-            nodes[uid]
-                .relation
-                .as_ref()
-                .map(|r| r.rendered.clone())
-                .unwrap_or_default()
         }
         TestTarget::Source(s, t) => {
             node.sources.insert((s.clone(), t.clone()));
-            session.render_str("<source>", &format!("{{{{ source({s:?}, {t:?}) }}}}"))?
         }
-    };
-    let cur = render_for_parse(session, &node, |s| call_test(s, &node, &model).map(|_| ()))
-        .map_err(|e| Error::new(format!("parsing test {name} in {}: {e}", p.file)))?;
+    }
+    let cur = render_for_parse(session, &node, |s| {
+        let model = tested_relation(s, nodes, &p.target)?;
+        call_test(s, &node, model).map(|_| ())
+    })
+    .map_err(|e| Error::new(format!("parsing test {name} in {}: {e}", p.file)))?;
     node.config = cur.config;
     node.depends_on.extend(cur.refs);
     node.sources.extend(cur.sources);
@@ -238,8 +241,23 @@ fn test_node(
 
 /// Renders a generic test's SQL: its macro called with `model`,
 /// `column_name` and its arguments. String arguments that are `ref(...)`
-/// or `source(...)` calls are evaluated, as dbt does.
-pub fn call_test(session: &Session, node: &Node, model: &str) -> Result<String, Error> {
+/// or `source(...)` calls are evaluated to relations, as dbt does.
+/// What a generic test tests: the relation of its node or source.
+pub fn tested_relation(
+    session: &Session,
+    nodes: &BTreeMap<String, Node>,
+    target: &TestTarget,
+) -> Result<Value, Error> {
+    match target {
+        TestTarget::Node(uid) => Ok(nodes[uid]
+            .relation
+            .clone()
+            .map_or_else(|| Value::from(""), |r| r.into_value())),
+        TestTarget::Source(s, t) => session.eval(&format!("source({s:?}, {t:?})")),
+    }
+}
+
+pub fn call_test(session: &Session, node: &Node, relation: Value) -> Result<String, Error> {
     let NodeKind::GenericTest {
         macro_name,
         args,
@@ -249,7 +267,10 @@ pub fn call_test(session: &Session, node: &Node, model: &str) -> Result<String, 
     else {
         unreachable!("only generic tests are called");
     };
-    let mut kwargs: Vec<(String, Value)> = vec![("model".into(), Value::from(model))];
+    // As in dbt, the test's `model` is the relation, or with a `where`
+    // config, the subquery dbt's `get_where_subquery` makes of it.
+    let model = session.call_macro_value("get_where_subquery", &[relation])?;
+    let mut kwargs: Vec<(String, Value)> = vec![("model".into(), model)];
     if let Some(col) = column {
         kwargs.push(("column_name".into(), Value::from(col.as_str())));
     }
@@ -263,9 +284,7 @@ fn eval_arg(session: &Session, v: &Json) -> Result<Value, Error> {
     if let Json::String(s) = v {
         let t = s.trim();
         if (t.starts_with("ref(") || t.starts_with("source(")) && t.ends_with(')') {
-            return Ok(Value::from(
-                session.render_str("<test argument>", &format!("{{{{ {t} }}}}"))?,
-            ));
+            return session.eval(t);
         }
     }
     Ok(Value::from_serialize(v))

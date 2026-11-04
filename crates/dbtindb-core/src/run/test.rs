@@ -1,4 +1,5 @@
-//! Running data tests: counting failing rows and applying `severity`,
+//! Running data tests as dbt does: `fail_calc` (by default the number of
+//! rows) over the test query, cut to `limit` rows, then `severity`,
 //! `warn_if` and `error_if`.
 
 use serde_json::Value;
@@ -16,16 +17,36 @@ pub struct Outcome {
 
 pub fn run(r: &Runner<'_>, node: &Node) -> Result<Outcome, Error> {
     let sql = r.s.compile(&node.unique_id, false)?;
-    let count = format!("SELECT count(*) AS failures FROM (\n{sql}\n) dbt_internal_test");
+    let c = &node.config;
+    let fail_calc = c.str("fail_calc")?.unwrap_or("count(*)");
+    let limit = match c.get("limit") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::Number(n)) if n.as_u64().is_some() => format!("\nlimit {n}"),
+        Some(other) => {
+            return Err(Error::new(format!(
+                "test {}: limit must be a whole number, not {other}",
+                node.name
+            )));
+        }
+    };
+    let count = format!("SELECT {fail_calc} AS failures FROM (\n{sql}{limit}\n) dbt_internal_test");
     let table =
         r.db.query(&count)
             .map_err(|e| Error::new(format!("{e}\nwhile running test {}:\n{count}", node.name)))?;
     let failures = match table.rows.first().and_then(|row| row.first()) {
-        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
-        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f.round() as i64))
+            .unwrap_or(0),
+        Some(Value::String(s)) => s.parse::<f64>().map(|f| f.round() as i64).map_err(|_| {
+            Error::new(format!(
+                "test {}: fail_calc gave {s:?}, not a number",
+                node.name
+            ))
+        })?,
+        // `sum(...)` over no rows: nothing failed.
         _ => 0,
     };
-    let c = &node.config;
     let severity = c.str("severity")?.unwrap_or("error").to_ascii_lowercase();
     let error_if = threshold(c.str("error_if")?.unwrap_or("!= 0"))?;
     let warn_if = threshold(c.str("warn_if")?.unwrap_or("!= 0"))?;

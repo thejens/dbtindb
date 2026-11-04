@@ -6,11 +6,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use minijinja::listener::RenderingEventListener;
-use minijinja::value::Object;
+use minijinja::value::{Enumerator, Object, ObjectRepr};
 use minijinja::{Error, ErrorKind, State, Value};
 
+use super::api::ColumnObject;
 use super::relation::Relation;
-use super::{Shared, jinja_error, to_json};
+use super::{Shared, jinja_error, packages, statements, to_json};
 
 /// A Rust function exposed to Jinja with full access to its arguments
 /// (positional and keyword) and to the shared state of the run.
@@ -191,6 +192,13 @@ impl Object for Exceptions {
 pub struct Adapter(pub Arc<Shared>);
 
 impl Object for Adapter {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str()? {
+            "behavior" => Some(Value::from_object(Behavior)),
+            _ => None,
+        }
+    }
+
     fn call_method(
         self: &Arc<Self>,
         state: &State<'_, '_>,
@@ -205,20 +213,20 @@ impl Object for Adapter {
             "quote" => Ok(Value::from(
                 shared.dialect.quote(&args.string(0, "identifier")?),
             )),
-            // dbt's dispatch: `<adapter>__name`, then `default__name`.
             "dispatch" => {
                 let name = args.string(0, "macro_name")?;
-                for prefix in [shared.dialect.name(), "default"] {
-                    let candidate = format!("{prefix}__{name}");
-                    if let Some(m) = state.lookup(&candidate, &[]) {
-                        return Ok(m);
-                    }
-                }
-                Err(jinja_error(format!(
-                    "adapter.dispatch: no macro named {}__{name} or default__{name}",
-                    shared.dialect.name()
-                )))
+                let namespace = args.get(1, "macro_namespace").filter(|v| !v.is_none());
+                packages::dispatch(
+                    state,
+                    shared.dialect.name(),
+                    &shared.project_name,
+                    &shared.dispatch,
+                    &shared.packages,
+                    &name,
+                    namespace.as_ref().and_then(Value::as_str),
+                )
             }
+            "execute" => statements::execute(shared, &args),
             "get_relation" => {
                 let schema = args.string(1, "schema")?;
                 let identifier = args.string(2, "identifier")?;
@@ -232,29 +240,107 @@ impl Object for Adapter {
                     },
                 )
             }
+            "load_relation" => statements::load_relation(shared, state, &args),
             "get_columns_in_relation" => {
                 let rel = args
                     .get(0, "relation")
                     .ok_or_else(|| jinja_error("get_columns_in_relation(): missing relation"))?;
-                let Some(rel) = rel.downcast_object_ref::<Relation>() else {
+                let Some(rel) = relation_of(&rel) else {
                     return Err(jinja_error("get_columns_in_relation() takes a relation"));
                 };
                 let Some(db) = shared.db_when_executing() else {
                     return Ok(Value::from(Vec::<Value>::new()));
                 };
                 let cols = db.columns(&rel.schema, &rel.identifier).map_err(to_jinja)?;
-                Ok(Value::from_serialize(
-                    cols.iter()
-                        .map(|c| {
-                            serde_json::json!({"name": c.name, "column": c.name,
-                                "data_type": c.data_type, "dtype": c.data_type})
-                        })
-                        .collect::<Vec<_>>(),
-                ))
+                let mut out = Vec::with_capacity(cols.len());
+                for c in &cols {
+                    let data_type = if c.data_type.is_empty() {
+                        stored_type(db.as_ref(), shared, &rel, &c.name)?
+                    } else {
+                        c.data_type.clone()
+                    };
+                    out.push(ColumnObject::value(shared.dialect, &c.name, &data_type));
+                }
+                Ok(Value::from(out))
             }
             _ => Err(Error::from(ErrorKind::UnknownMethod)),
         }
     }
+}
+
+/// The type of what a column holds, for a SQLite column declared without
+/// one (a view's computed column): macros cast to `column.data_type`, and
+/// `cast(x as )` is not SQL. A column of NULLs is TEXT, which casts NULL
+/// to NULL.
+fn stored_type(
+    db: &dyn crate::Database,
+    shared: &Shared,
+    rel: &Relation,
+    column: &str,
+) -> Result<String, Error> {
+    let d = shared.dialect;
+    let col = d.quote(column);
+    let sql = format!(
+        "SELECT typeof({col}) FROM {} WHERE {col} IS NOT NULL LIMIT 1",
+        rel.rendered
+    );
+    let table = db.query(&sql).map_err(to_jinja)?;
+    let kind = table
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("text");
+    Ok(match kind {
+        "integer" => "INTEGER",
+        "real" => "REAL",
+        "blob" => "BLOB",
+        _ => "TEXT",
+    }
+    .to_owned())
+}
+
+/// `adapter.behavior`: dbt's behaviour-change flags. dbtindb keeps each
+/// at its default, which is off for every flag the dbt macros consult.
+#[derive(Debug)]
+struct Behavior;
+
+impl Object for Behavior {
+    fn get_value(self: &Arc<Self>, _key: &Value) -> Option<Value> {
+        Some(Value::from_object(Flag))
+    }
+}
+
+/// One behaviour flag: false, whether read as `flag` or `flag.no_warn`.
+#[derive(Debug)]
+struct Flag;
+
+impl Object for Flag {
+    fn is_true(self: &Arc<Self>) -> bool {
+        false
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        (key.as_str()? == "no_warn").then(|| Value::from(false))
+    }
+
+    fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("False")
+    }
+}
+
+/// The relation a value stands for: a relation, or `this`.
+pub fn relation_of(v: &Value) -> Option<Relation> {
+    if let Some(rel) = v.downcast_object_ref::<Relation>() {
+        return Some(rel.clone());
+    }
+    v.downcast_object_ref::<This>()?
+        .0
+        .current
+        .lock()
+        .unwrap()
+        .this
+        .clone()
 }
 
 /// `this`: the relation of the node being rendered.
@@ -268,8 +354,32 @@ impl This {
 }
 
 impl Object for This {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Map
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        match self.current() {
+            Some(rel) => rel.enumerate(),
+            None => Enumerator::Empty,
+        }
+    }
+
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
         self.current()?.get_value(key)
+    }
+
+    fn call_method(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        method: &str,
+        args: &[Value],
+        listeners: &[Rc<dyn RenderingEventListener>],
+    ) -> Result<Value, Error> {
+        match self.current() {
+            Some(rel) => rel.call_method(state, method, args, listeners),
+            None => Err(jinja_error("`this` is only defined while rendering a node")),
+        }
     }
 
     fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {

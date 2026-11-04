@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use minijinja::{Environment, Value};
 use serde_json::{Map, Value as Json};
 
-use crate::context::{self, Current, Shared};
+use crate::context::{self, Current, InvocationFlags, Shared};
 use crate::node::Manifest;
 use crate::project::Project;
 use crate::{Database, Dialect, Error, parse};
@@ -62,6 +62,9 @@ impl Session {
             db,
             names: RwLock::new(BTreeMap::new()),
             sources: project.properties.sources.clone(),
+            dispatch: project.settings.dispatch.clone(),
+            packages: project.packages.keys().cloned().collect(),
+            flags: Mutex::new(InvocationFlags::default()),
             current: Mutex::new(Current::default()),
         });
         let mut env = context::environment(&project, shared.clone())?;
@@ -76,23 +79,46 @@ impl Session {
         Ok(session)
     }
 
-    /// Calls a macro by name (looked up in dbt's global namespace) and
-    /// returns what it renders or `return()`s, as text.
+    /// Calls a macro by name, bare (looked up in dbt's global namespace)
+    /// or as `<package>.<name>`, and returns what it renders or
+    /// `return()`s, as text.
     pub fn call_macro(&self, name: &str, args: &[Value]) -> Result<String, Error> {
-        let template = self.env.get_template(SCRATCH)?;
-        let state = template.eval_to_state((), &[])?;
-        state.call_macro(name, args, &[]).map_err(Error::from)
+        Ok(self.call_macro_value(name, args)?.to_string())
     }
 
-    /// Whether a macro of this name exists, in the project or built in.
+    /// As [`Session::call_macro`], but returns the value a macro
+    /// `return()`s as it is: a relation stays a relation.
+    pub fn call_macro_value(&self, name: &str, args: &[Value]) -> Result<Value, Error> {
+        let template = self.env.get_template(SCRATCH)?;
+        let state = template.eval_to_state((), &[])?;
+        let f = context::resolve_macro(&state, name)
+            .ok_or_else(|| Error::new(format!("there is no macro named {name:?}")))?;
+        Ok(f.call(&state, args, &[])?)
+    }
+
+    /// Evaluates a Jinja expression, such as `ref('orders')`, to its value.
+    pub fn eval(&self, expr: &str) -> Result<Value, Error> {
+        Ok(self.env.compile_expression(expr)?.eval((), &[])?)
+    }
+
+    /// Whether a macro of this name exists, in the project, a package or
+    /// built in.
     pub fn has_macro(&self, name: &str) -> bool {
         let Ok(template) = self.env.get_template(SCRATCH) else {
             return false;
         };
         template
             .eval_to_state((), &[])
-            .map(|s| s.lookup(name, &[]).is_some())
+            .map(|s| context::resolve_macro(&s, name).is_some())
             .unwrap_or(false)
+    }
+
+    /// Sets what `flags` reports for this invocation.
+    pub fn set_flags(&self, which: &'static str, full_refresh: bool) {
+        *self.shared.flags.lock().unwrap() = InvocationFlags {
+            which,
+            full_refresh,
+        };
     }
 
     /// Renders a template file with the context of the current node.

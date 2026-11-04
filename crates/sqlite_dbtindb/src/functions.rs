@@ -24,6 +24,9 @@ thread_local! {
 
 type Impl = fn(&Call<'_>) -> Result<String, Error>;
 
+/// A pure function: NULL in, NULL out, as in PostgreSQL.
+type PureFn = fn(&Call<'_>) -> Result<Option<String>, String>;
+
 /// Registers the functions on `db`.
 ///
 /// # Safety
@@ -34,7 +37,7 @@ pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
     // generated columns, where whoever can write the schema could make
     // other users run them.
     let flags = ffi::SQLITE_UTF8 | ffi::SQLITE_DIRECTONLY;
-    let functions: [(&CStr, &[c_int], Impl); 10] = [
+    let functions: [(&CStr, &[c_int], Impl); 9] = [
         (c"dbtindb_build", &[0, 1], |c| command(c, Command::Build)),
         (c"dbtindb_run", &[0, 1], |c| command(c, Command::Run)),
         (c"dbtindb_seed", &[0, 1], |c| command(c, Command::Seed)),
@@ -46,16 +49,9 @@ pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
         (c"dbtindb_compile", &[1, 2], compile),
         (c"dbtindb_sql", &[1, 2], sql),
         (c"dbtindb_view", &[2, 3], view),
-        (c"dbtindb_md5", &[1], md5),
     ];
     for (name, arities, f) in functions {
         for &n in arities {
-            let pure = name == c"dbtindb_md5";
-            let flags = if pure {
-                ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC
-            } else {
-                flags
-            };
             // SAFETY: forwarded from the caller.
             unsafe {
                 sqlite::create_function(
@@ -63,9 +59,29 @@ pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
                     name,
                     n,
                     flags,
-                    Box::new(move |call| f(call).map_err(|e| format!("dbtindb: {e}"))),
+                    Box::new(move |call| f(call).map(Some).map_err(|e| format!("dbtindb: {e}"))),
                 )?;
             }
+        }
+    }
+    // Pure functions that compiled SQL calls: dbt's `hash` and `split_part`
+    // macros on SQLite. They are safe anywhere, including in views.
+    let pure: [(&CStr, c_int, PureFn); 2] = [
+        (c"dbtindb_md5", 1, md5),
+        (c"dbtindb_split_part", 3, split_part),
+    ];
+    for (name, n, f) in pure {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            sqlite::create_function(
+                db,
+                name,
+                n,
+                ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC,
+                Box::new(move |call| {
+                    f(call).map_err(|e| format!("{}: {e}", name.to_string_lossy()))
+                }),
+            )?;
         }
     }
     Ok(())
@@ -154,15 +170,45 @@ fn view(call: &Call<'_>) -> Result<String, Error> {
     Ok(rendered)
 }
 
-fn md5(call: &Call<'_>) -> Result<String, Error> {
-    let bytes = match call.arg(0) {
-        Arg::Text(t) => t,
-        _ => &[],
+/// md5 of the argument's text, as hex.
+fn md5(call: &Call<'_>) -> Result<Option<String>, String> {
+    Ok(call.text(0).map(|bytes| {
+        Md5::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }))
+}
+
+/// PostgreSQL's `split_part(string, delimiter, n)`: the n-th field, counting
+/// from 1, or from the end when n is negative; '' past the last field.
+fn split_part(call: &Call<'_>) -> Result<Option<String>, String> {
+    let (Some(text), Some(delim), Some(n)) = (call.text(0), call.text(1), call.int(2)) else {
+        return Ok(None);
     };
-    Ok(Md5::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    let text = String::from_utf8_lossy(text);
+    let delim = String::from_utf8_lossy(delim);
+    if n == 0 {
+        return Err("field position must not be zero".into());
+    }
+    // An empty delimiter does not split: the string is the only field.
+    let fields: Vec<&str> = if delim.is_empty() {
+        vec![&text]
+    } else {
+        text.split(delim.as_ref()).collect()
+    };
+    let index = if n > 0 {
+        usize::try_from(n - 1).ok()
+    } else {
+        usize::try_from(-n)
+            .ok()
+            .and_then(|back| fields.len().checked_sub(back))
+    };
+    Ok(Some(
+        index
+            .and_then(|i| fields.get(i))
+            .map_or_else(String::new, |f| (*f).to_owned()),
+    ))
 }
 
 fn load(raw: Db, inv: &Invocation) -> Result<(dbtindb_core::Session, Arc<SqliteDb>), Error> {

@@ -173,12 +173,12 @@ fn test_def(item: &Value, where_: &str) -> Result<TestDef, Error> {
             )));
         }
     };
-    // dbt's own generic tests may be written with their namespace.
+    // dbt's own generic tests may be written with their namespace; other
+    // namespaces are packages (`dbt_utils.at_least_one`).
     let test = test.strip_prefix("dbt.").unwrap_or(&test).to_owned();
-    if test.contains('.') {
+    if test.matches('.').count() > 1 {
         return Err(Error::new(format!(
-            "{where_}: test {test:?} comes from a package; packages are not supported, \
-             so define it as a {{% test %}} block in macros/"
+            "{where_}: test {test:?} must be a name or <package>.<name>"
         )));
     }
     let mut args = Map::new();
@@ -191,7 +191,8 @@ fn test_def(item: &Value, where_: &str) -> Result<TestDef, Error> {
             // dbt 1.10+ nests arguments under `arguments:`.
             "arguments" => args.extend(v.as_object().cloned().unwrap_or_default()),
             // Config keys written next to the arguments, as older dbt allows.
-            "severity" | "where" | "warn_if" | "error_if" | "enabled" | "tags" | "limit" => {
+            "severity" | "where" | "warn_if" | "error_if" | "enabled" | "tags" | "limit"
+            | "fail_calc" | "store_failures" | "meta" => {
                 config.insert(k, v);
             }
             _ => {
@@ -283,14 +284,18 @@ sources:
     }
 
     #[test]
-    fn rejects_package_tests() {
+    fn reads_package_tests() {
         let mut p = Properties::default();
-        let err = p
-            .add_file(
-                "models/s.yml",
-                "models:\n  - name: m\n    tests: [dbt_utils.at_least_one]\n",
-            )
-            .unwrap_err();
-        assert!(err.0.contains("packages are not supported"), "{err}");
+        p.add_file(
+            "models/s.yml",
+            "models:\n  - name: m\n    tests: [dbt_utils.at_least_one, dbt.not_null]\n",
+        )
+        .unwrap();
+        let tests: Vec<_> = p.models["m"]
+            .tests
+            .iter()
+            .map(|t| t.test.as_str())
+            .collect();
+        assert_eq!(tests, ["dbt_utils.at_least_one", "not_null"]);
     }
 }

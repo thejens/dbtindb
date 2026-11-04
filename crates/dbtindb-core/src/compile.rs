@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::node::{Node, NodeKind, TestTarget};
+use crate::node::{Node, NodeKind};
 use crate::session::Session;
 use crate::{Error, testgen};
 
@@ -98,22 +98,8 @@ impl Session {
             NodeKind::Model(_) | NodeKind::SingularTest => self.render_file(&node.path),
             NodeKind::Snapshot => self.call_macro(&format!("snapshot_{}", node.name), &[]),
             NodeKind::GenericTest { target, .. } => {
-                let rel = match target {
-                    TestTarget::Node(id) => self.manifest.nodes[id]
-                        .relation
-                        .as_ref()
-                        .map(|r| r.rendered.clone())
-                        .unwrap_or_default(),
-                    TestTarget::Source(s, t) => {
-                        self.render_str("<source>", &format!("{{{{ source({s:?}, {t:?}) }}}}"))?
-                    }
-                };
-                // `where` narrows the tested relation, as dbt does.
-                let model = match node.config.str("where")? {
-                    Some(cond) => format!("(select * from {rel} where {cond}) dbt_subquery"),
-                    None => rel,
-                };
-                testgen::call_test(self, node, &model)
+                testgen::tested_relation(self, &self.manifest.nodes, target)
+                    .and_then(|rel| testgen::call_test(self, node, rel))
             }
             NodeKind::Seed => Err(Error::new(format!("{unique_id} is a seed; it has no SQL"))),
         };
