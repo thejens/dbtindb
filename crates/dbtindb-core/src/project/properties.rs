@@ -1,10 +1,11 @@
 //! Property files (`schema.yml` and friends): descriptions, config, data
-//! tests and sources.
+//! tests, unit tests and sources.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use super::unit_tests::{self, UnitTestDef};
 use crate::{Error, yaml};
 
 /// Everything the project's property files declare, merged.
@@ -15,6 +16,7 @@ pub struct Properties {
     pub snapshots: BTreeMap<String, ResourceProps>,
     pub analyses: BTreeMap<String, ResourceProps>,
     pub sources: BTreeMap<(String, String), SourceTable>,
+    pub unit_tests: Vec<UnitTestDef>,
 }
 
 /// Properties of one model, seed or snapshot.
@@ -121,6 +123,20 @@ impl Properties {
                 }
             }
         }
+        for entry in list(doc.get("unit_tests"), &ctx("unit_tests"))? {
+            let def = unit_tests::parse(path, entry)?;
+            if let Some(prev) = self
+                .unit_tests
+                .iter()
+                .find(|u| u.model == def.model && u.name == def.name)
+            {
+                return Err(Error::new(format!(
+                    "unit test {:?} of model {:?} is declared in both {} and {path}",
+                    def.name, def.model, prev.file
+                )));
+            }
+            self.unit_tests.push(def);
+        }
         Ok(())
     }
 }
@@ -217,7 +233,7 @@ fn test_def(item: &Value, where_: &str) -> Result<TestDef, Error> {
     })
 }
 
-fn list<'a>(v: Option<&'a Value>, where_: &str) -> Result<Vec<&'a Value>, Error> {
+pub(super) fn list<'a>(v: Option<&'a Value>, where_: &str) -> Result<Vec<&'a Value>, Error> {
     match v {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => Ok(items.iter().collect()),
@@ -225,14 +241,14 @@ fn list<'a>(v: Option<&'a Value>, where_: &str) -> Result<Vec<&'a Value>, Error>
     }
 }
 
-fn string(v: &Value, key: &str, where_: &str) -> Result<String, Error> {
+pub(super) fn string(v: &Value, key: &str, where_: &str) -> Result<String, Error> {
     v.get(key)
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| Error::new(format!("{where_}: every entry needs a {key}")))
 }
 
-fn optional_string(v: &Value, key: &str) -> Result<Option<String>, Error> {
+pub(super) fn optional_string(v: &Value, key: &str) -> Result<Option<String>, Error> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),

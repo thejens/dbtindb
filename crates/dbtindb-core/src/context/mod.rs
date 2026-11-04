@@ -69,6 +69,19 @@ pub struct Current {
     pub parsed_refs: Option<BTreeSet<String>>,
     /// What `store_result()` kept, for `load_result()`.
     pub results: BTreeMap<String, Value>,
+    /// While compiling a unit test: what stands in for the model's inputs.
+    pub fixtures: Option<Fixtures>,
+}
+
+/// A unit test's stand-ins: CTEs for the inputs a model reads, and the
+/// vars and environment it sees.
+#[derive(Clone, Debug, Default)]
+pub struct Fixtures {
+    /// By the unique id of the node `ref()` names.
+    pub refs: BTreeMap<String, Relation>,
+    pub sources: BTreeMap<(String, String), Relation>,
+    pub vars: Map<String, Json>,
+    pub env_vars: Map<String, Json>,
 }
 
 /// The command-line flags of the invocation, as `flags` shows them.
@@ -374,6 +387,15 @@ fn ref_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
         )));
     }
     cur.refs.insert(target.unique_id.clone());
+    if let Some(fixtures) = &cur.fixtures {
+        return match fixtures.refs.get(&target.unique_id) {
+            Some(cte) => Ok(cte.clone().into_value()),
+            None => Err(jinja_error(format!(
+                "{} refs {name:?}, which the unit test does not give; add it to given",
+                cur.node
+            ))),
+        };
+    }
     if target.ephemeral && cur.execute {
         if !cur.ctes.contains(&target.unique_id) {
             cur.ctes.push(target.unique_id.clone());
@@ -392,7 +414,17 @@ fn source_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error
         Some(t) => (t.schema.clone(), t.identifier.clone()),
         None => (source, table),
     };
-    s.current.lock().unwrap().sources.insert(key);
+    let mut cur = s.current.lock().unwrap();
+    cur.sources.insert(key.clone());
+    if let Some(fixtures) = &cur.fixtures {
+        return match fixtures.sources.get(&key) {
+            Some(cte) => Ok(cte.clone().into_value()),
+            None => Err(jinja_error(format!(
+                "{} reads source {:?}.{:?}, which the unit test does not give; add it to given",
+                cur.node, key.0, key.1
+            ))),
+        };
+    }
     Ok(s.relation(&schema, &identifier).into_value())
 }
 
@@ -419,7 +451,14 @@ fn doc_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
 
 fn var_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
     let name = a.string(0, "name")?;
-    match (s.vars.get(&name), a.get(1, "default")) {
+    let fixed = s
+        .current
+        .lock()
+        .unwrap()
+        .fixtures
+        .as_ref()
+        .and_then(|f| f.vars.get(&name).cloned());
+    match (fixed.as_ref().or(s.vars.get(&name)), a.get(1, "default")) {
         (Some(v), _) => Ok(Value::from_serialize(v)),
         (None, Some(d)) => Ok(d),
         (None, None) => Err(jinja_error(format!(
@@ -430,8 +469,19 @@ fn var_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
 
 /// The database server's environment is not the project's to read; vars
 /// take its place. A default is honoured so projects still compile.
-fn env_var_fn(_: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+fn env_var_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
     let name = a.string(0, "var")?;
+    // A unit test's `overrides: {env_vars: ...}`.
+    let fixed = s
+        .current
+        .lock()
+        .unwrap()
+        .fixtures
+        .as_ref()
+        .and_then(|f| f.env_vars.get(&name).cloned());
+    if let Some(v) = fixed {
+        return Ok(Value::from_serialize(v));
+    }
     a.get(1, "default").ok_or_else(|| {
         jinja_error(format!(
             "env_var({name:?}): environment variables are not available inside the database; use var() instead"

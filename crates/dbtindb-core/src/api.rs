@@ -157,7 +157,7 @@ pub fn compile(session: &Session, name: &str) -> Result<String, Error> {
     let m = &session.manifest;
     let node = m.nodes.values().find(|n| n.name == name).ok_or_else(|| {
         Error::new(format!(
-            "no enabled model, snapshot, test or analysis named {name:?}"
+            "no enabled model, snapshot, test, unit test or analysis named {name:?}"
         ))
     })?;
     if node.kind_is_seed() {

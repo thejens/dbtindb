@@ -11,6 +11,7 @@ mod docs;
 mod packages;
 mod properties;
 mod settings;
+pub mod unit_tests;
 
 use std::collections::BTreeMap;
 

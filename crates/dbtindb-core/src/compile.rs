@@ -12,6 +12,11 @@ impl Session {
     /// test's query for failing rows. `is_incremental` is what the node's
     /// `is_incremental()` returns.
     pub fn compile(&self, unique_id: &str, is_incremental: bool) -> Result<String, Error> {
+        if let Some(node) = self.manifest.nodes.get(unique_id)
+            && let NodeKind::UnitTest(_) = node.kind
+        {
+            return self.compile_unit_test(node);
+        }
         let mut seen = BTreeSet::new();
         let (sql, ctes) = self.render_node(unique_id, is_incremental)?;
         let mut defs = Vec::new();
@@ -69,7 +74,7 @@ impl Session {
         .map(|s| s.trim().to_owned())
     }
 
-    fn begin_execute(&self, node: &Node, is_incremental: bool) {
+    pub(crate) fn begin_execute(&self, node: &Node, is_incremental: bool) {
         self.shared.begin(
             true,
             &node.unique_id,
@@ -104,6 +109,7 @@ impl Session {
                     .and_then(|rel| testgen::call_test(self, node, rel))
             }
             NodeKind::Seed => Err(Error::new(format!("{unique_id} is a seed; it has no SQL"))),
+            NodeKind::UnitTest(_) => unreachable!("unit tests compile on their own"),
         };
         let cur = self.shared.finish();
         let rendered = rendered.map_err(|e| Error::new(format!("compiling {}: {e}", node.path)))?;
@@ -136,7 +142,7 @@ impl Session {
 
 /// Puts ephemeral models in front of `sql` as CTEs, merging with a WITH
 /// clause the query already has, as dbt does.
-fn inject_ctes(sql: &str, defs: &[(String, String)]) -> String {
+pub(crate) fn inject_ctes(sql: &str, defs: &[(String, String)]) -> String {
     if defs.is_empty() {
         return sql.to_owned();
     }

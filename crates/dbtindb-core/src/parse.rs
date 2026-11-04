@@ -8,6 +8,7 @@ use minijinja::Value;
 use crate::config::Config;
 use crate::context::{Current, RefTarget, Relation};
 use crate::node::{Manifest, Materialized, Node, NodeKind, ResourceType};
+use crate::project::unit_tests::UnitTestDef;
 use crate::project::{ColumnProps, NodeFile, ResourceProps};
 use crate::session::Session;
 use crate::{Error, testgen};
@@ -170,6 +171,11 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
             unreachable!("test names are made unique");
         }
     }
+    for def in &session.project.properties.unit_tests {
+        if let Some(node) = unit_test_node(session, &nodes, def)? {
+            nodes.insert(node.unique_id.clone(), node);
+        }
+    }
     // Tests that store their failures are named only now.
     resolve_relations(session, &mut nodes)?;
     Ok(Manifest {
@@ -255,6 +261,57 @@ fn parse_node(
         )));
     }
     Ok(node)
+}
+
+/// The node of a unit test, or `None` when it or its model is disabled.
+fn unit_test_node(
+    session: &Session,
+    nodes: &BTreeMap<String, Node>,
+    def: &UnitTestDef,
+) -> Result<Option<Node>, Error> {
+    let project = &session.shared.project_name;
+    let model = format!("model.{project}.{}", def.model);
+    if !nodes.contains_key(&model) {
+        let disabled = session
+            .shared
+            .names
+            .read()
+            .unwrap()
+            .get(&def.model)
+            .is_some_and(|t| t.unique_id == model && !t.enabled);
+        if disabled {
+            return Ok(None);
+        }
+        return Err(Error::new(format!(
+            "{}: unit test {:?} tests {:?}, which is not a model",
+            def.file, def.name, def.model
+        )));
+    }
+    let mut config = Config::default();
+    config.merge(&def.config);
+    if !config.enabled()? {
+        return Ok(None);
+    }
+    let file = session.project.declared_in(&def.file, &def.name);
+    let mut fqn = vec![project.clone()];
+    fqn.extend(file.dirs);
+    fqn.extend([def.model.clone(), def.name.clone()]);
+    Ok(Some(Node {
+        unique_id: format!("unit_test.{project}.{}.{}", def.model, def.name),
+        resource_type: ResourceType::UnitTest,
+        name: def.name.clone(),
+        path: def.file.clone(),
+        fqn,
+        config,
+        kind: NodeKind::UnitTest(Box::new(def.clone())),
+        relation: None,
+        // Like a data test of the model: selected with it, and run before
+        // anything downstream of it.
+        depends_on: BTreeSet::from([model]),
+        sources: BTreeSet::new(),
+        description: render_description(session, &def.file, &def.description)?,
+        columns: Vec::new(),
+    }))
 }
 
 /// A description as dbt shows it: rendered, so `{{ doc('orders') }}`

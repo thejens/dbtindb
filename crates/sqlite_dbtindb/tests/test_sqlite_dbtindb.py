@@ -432,6 +432,77 @@ from src
         self.assertEqual(objects(conn), [("table", "accepted_values_m_n"), ("table", "m")])
 
 
+class UnitTestTest(unittest.TestCase):
+    UNIT_TESTS = """
+unit_tests:
+  - name: sums_per_customer
+    model: totals
+    given:
+      - input: ref('stg')
+        rows:
+          - {id: 1, customer_id: 1, amount: 10}
+          - {id: 2, customer_id: 1, amount: 5}
+          - {id: 3, customer_id: 2}
+    expect:
+      rows:
+        - {customer_id: 1, total: 15}
+        - {customer_id: 2, total: null}
+  - name: wrong_sum
+    model: totals
+    given:
+      - input: ref('stg')
+        format: csv
+        rows: |
+          id,customer_id,amount
+          1,1,10
+    expect:
+      rows: [{customer_id: 1, total: 11}]
+  - name: only_new_rows
+    model: inc
+    overrides:
+      macros: {is_incremental: true}
+    given:
+      - input: ref('stg')
+        rows: [{id: 1}, {id: 2}, {id: 3}]
+      - input: this
+        format: sql
+        rows: select 2 as id
+    expect:
+      rows: [{id: 3}]
+"""
+
+    def project(self, conn):
+        conn.executescript("CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount INTEGER);")
+        put(conn, {
+            "models/stg.sql": "select * from orders",
+            "models/totals.sql": "{{ config(materialized='table') }}\n"
+                                 "select customer_id, sum(amount) as total from {{ ref('stg') }} group by 1",
+            "models/inc.sql": "{{ config(materialized='incremental') }}\nselect id from {{ ref('stg') }}\n"
+                              "{% if is_incremental() %}where id > (select max(id) from {{ this }}){% endif %}",
+            "models/unit_tests.yml": self.UNIT_TESTS,
+        })
+
+    def test_unit_tests_compare_the_model_on_fixture_rows(self):
+        conn = connect()
+        self.project(conn)
+        # Fixture rows are typed by the inputs' columns, so those must exist.
+        with self.assertRaisesRegex(sqlite3.OperationalError, "has no relation in the database"):
+            call(conn, "dbtindb_test", json.dumps({"select": "totals"}))
+        call(conn, "dbtindb_run")
+        r = call(conn, "dbtindb_test", json.dumps({"select": "resource_type:unit_test"}))
+        statuses = {s["name"]: (s["status"], s["failures"]) for s in r["steps"]}
+        self.assertEqual(statuses, {
+            "sums_per_customer": ("pass", 0),
+            "wrong_sum": ("fail", 2),
+            "only_new_rows": ("pass", 0),
+        })
+        (compiled,) = conn.execute("SELECT dbtindb_compile('only_new_rows')").fetchone()
+        self.assertIn('"__dbt__cte__fixture_this"', compiled)
+        # A failing unit test fails the build, before anything downstream.
+        with self.assertRaisesRegex(sqlite3.OperationalError, "test wrong_sum failed"):
+            call(conn, "dbtindb_build")
+
+
 class SafetyTest(unittest.TestCase):
     def test_never_replaces_relations_it_did_not_create(self):
         conn = shop()
@@ -464,7 +535,7 @@ class SafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(sqlite3.OperationalError, "no dbtindb_files table"):
             conn.execute("SELECT dbtindb_ls()").fetchone()
         conn = shop()
-        with self.assertRaisesRegex(sqlite3.OperationalError, 'no enabled model, snapshot, test or analysis named "nope"'):
+        with self.assertRaisesRegex(sqlite3.OperationalError, 'no enabled model, snapshot, test, unit test or analysis named "nope"'):
             conn.execute("SELECT dbtindb_compile('nope')").fetchone()
         with self.assertRaisesRegex(sqlite3.OperationalError, "unknown option"):
             call(conn, "dbtindb_ls", '{"selec": "x"}')

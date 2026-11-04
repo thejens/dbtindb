@@ -363,6 +363,34 @@ mod tests {
     }
 
     #[pg_test]
+    fn unit_tests_compare_the_model_on_fixture_rows() {
+        Spi::run("CREATE TABLE orders (id int, customer_id int, amount numeric, ordered_at date)")
+            .unwrap();
+        file(
+            "models/totals.sql",
+            "{{ config(materialized='table') }}\n\
+             select customer_id, sum(amount) as total, max(ordered_at) as last_order\n\
+             from {{ source('raw', 'orders') }} where ordered_at >= '{{ var('since', '2000-01-01') }}' group by 1",
+        );
+        file(
+            "models/schema.yml",
+            "sources:\n  - name: raw\n    schema: public\n    tables: [{name: orders}]\n\
+             unit_tests:\n  - name: totals_since\n    model: totals\n    \
+             overrides: {vars: {since: '2024-02-01'}}\n    given:\n      \
+             - input: source('raw', 'orders')\n        format: csv\n        rows: |\n          \
+             id,customer_id,amount,ordered_at\n          1,1,2.5,2024-01-15\n          \
+             2,1,4.25,2024-02-02\n          3,2,1,2024-03-01\n    expect:\n      rows:\n        \
+             - {customer_id: 1, total: 4.25, last_order: 2024-02-02}\n        \
+             - {customer_id: 2, total: 1, last_order: 2024-03-01}\n",
+        );
+        Spi::run("SELECT * FROM dbtindb_run()").unwrap();
+        assert_eq!(
+            text("SELECT status || ':' || failures FROM dbtindb_test() WHERE resource_type = 'unit_test'"),
+            "pass:0"
+        );
+    }
+
+    #[pg_test]
     fn refreshes_materialized_views_until_their_query_changes() {
         Spi::run("CREATE TABLE src (id int); INSERT INTO src VALUES (1)").unwrap();
         file(
@@ -567,7 +595,9 @@ mod tests {
 
         let err = error_of("SELECT dbtindb_compile('missing')");
         assert!(
-            err.contains("no enabled model, snapshot, test or analysis named \"missing\""),
+            err.contains(
+                "no enabled model, snapshot, test, unit test or analysis named \"missing\""
+            ),
             "{err}"
         );
     }

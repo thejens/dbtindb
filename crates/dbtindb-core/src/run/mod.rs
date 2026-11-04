@@ -12,6 +12,7 @@ mod managed;
 mod materialize;
 mod snapshot;
 mod test;
+mod unit_test;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -50,7 +51,7 @@ impl Command {
             Command::Run => rt == ResourceType::Model,
             Command::Seed => rt == ResourceType::Seed,
             Command::Snapshot => rt == ResourceType::Snapshot,
-            Command::Test => rt == ResourceType::Test,
+            Command::Test => matches!(rt, ResourceType::Test | ResourceType::UnitTest),
             // Analyses are only ever compiled.
             Command::Build => rt != ResourceType::Analysis,
         }
@@ -321,8 +322,11 @@ impl Runner<'_> {
             sql.push(self.render_and_run(Some(&node.unique_id), &hook)?);
         }
         let (action, status, failures) = match &node.kind {
-            NodeKind::SingularTest | NodeKind::GenericTest { .. } => {
-                let r = test::run(self, node)?;
+            NodeKind::SingularTest | NodeKind::GenericTest { .. } | NodeKind::UnitTest(_) => {
+                let r = match node.kind {
+                    NodeKind::UnitTest(_) => unit_test::run_unit_test(self, node)?,
+                    _ => test::run(self, node)?,
+                };
                 sql.push(r.sql);
                 if r.status == "fail" && command == Command::Build {
                     return Err(Error::new(format!(

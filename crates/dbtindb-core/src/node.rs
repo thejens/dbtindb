@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::context::Relation;
 use crate::project::ColumnProps;
+use crate::project::unit_tests::UnitTestDef;
 use crate::{Config, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -15,6 +16,7 @@ pub enum ResourceType {
     Seed,
     Snapshot,
     Test,
+    UnitTest,
     Analysis,
 }
 
@@ -25,6 +27,7 @@ impl ResourceType {
             ResourceType::Seed => "seed",
             ResourceType::Snapshot => "snapshot",
             ResourceType::Test => "test",
+            ResourceType::UnitTest => "unit_test",
             ResourceType::Analysis => "analysis",
         }
     }
@@ -87,6 +90,8 @@ pub enum NodeKind {
         target: TestTarget,
         column: Option<String>,
     },
+    /// A dbt 1.8 unit test of a model.
+    UnitTest(Box<UnitTestDef>),
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +125,7 @@ impl Node {
     /// Where a test keeps its failing rows (`store_failures`,
     /// `store_failures_as`): a table, a view, or nowhere.
     pub fn stored_failures(&self) -> Result<Option<Materialized>, Error> {
-        if !self.is_test() {
+        if self.resource_type != ResourceType::Test {
             return Ok(None);
         }
         match self.config.str("store_failures_as")? {
@@ -144,7 +149,10 @@ impl Node {
     }
 
     pub fn is_test(&self) -> bool {
-        self.resource_type == ResourceType::Test
+        matches!(
+            self.resource_type,
+            ResourceType::Test | ResourceType::UnitTest
+        )
     }
 
     /// The node as Jinja sees it in `model` and in `generate_schema_name`'s

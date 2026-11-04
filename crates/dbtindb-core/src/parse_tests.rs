@@ -371,3 +371,31 @@ fn yaml_snapshots_snapshot_a_ref_or_source() {
         "{err}"
     );
 }
+
+#[test]
+fn unit_tests_become_nodes_of_their_model() {
+    let unit = "unit_tests:\n  - name: t\n    model: m\n    given: []\n    expect: {rows: []}\n";
+    let s = load(
+        &[("models/m.sql", "select 1 as id"), ("models/u.yml", unit)],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let t = &s.manifest.nodes["unit_test.dbtindb.m.t"];
+    assert_eq!(t.resource_type, ResourceType::UnitTest);
+    assert_eq!(t.depends_on.iter().collect::<Vec<_>>(), ["model.dbtindb.m"]);
+    assert_eq!(t.fqn, ["dbtindb", "m", "t"]);
+
+    let disabled = load(
+        &[
+            ("models/m.sql", "{{ config(enabled=false) }} select 1"),
+            ("models/u.yml", unit),
+        ],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    assert!(disabled.manifest.nodes.is_empty());
+    let err = load(&[("models/u.yml", unit)], Dialect::Postgres)
+        .err()
+        .unwrap();
+    assert!(err.0.contains("tests \"m\", which is not a model"), "{err}");
+}
