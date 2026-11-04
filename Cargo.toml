@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/dbinja-core", "crates/pg_dbinja", "crates/sqlite_dbinja"]
+
+[workspace.package]
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/thejens/dbinja"
+
+[workspace.dependencies]
+# dbt v2's fork of MiniJinja: the Jinja dialect dbt itself renders with,
+# including dbt's block tags ({% materialization %}, {% test %}, {% docs %},
+# {% snapshot %}). dbt does not publish its crates, so it comes from git,
+# pinned to the commit of the v2.0.5 release tag (the same pin dbt-temporal
+# uses). Its default features are required: dbt only builds it that way.
+minijinja = { git = "https://github.com/dbt-labs/dbt", rev = "a3bdd96bf62f02c8babb060a79f32de6998c235a", package = "minijinja", features = ["loader", "custom_syntax", "preserve_order", "fuel"] }
+serde_json = "1.0.154"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+# rustc strips release debuginfo by default; on macOS 27 / ld-27037 the
+# stripped dylib is rejected by dyld ("mis-aligned LINKEDIT string pool").
+strip = false
+
+[profile.dev]
+panic = "unwind"

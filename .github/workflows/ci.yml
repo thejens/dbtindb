@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  PGRX_VERSION: 0.19.3
+  # pg_dbinja reads models from pgjinja's jinja_templates table, so the
+  # tests install pgjinja first. Pinned, so a pgjinja change cannot break
+  # this repo's CI unnoticed.
+  PGJINJA_REV: 6338f16b6181cbc401bc75c02744e13fd7cfbdf3
+
+jobs:
+  postgres:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18]
+    env:
+      PG: ${{ matrix.pg }}
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ matrix.pg }}
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y "postgresql-$PG" "postgresql-server-dev-$PG"
+          # cargo pgrx installs extensions into the system Postgres.
+          sudo chmod a+rwx "$($PG_CONFIG --pkglibdir)" "$($PG_CONFIG --sharedir)/extension"
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Initialise pgrx
+        run: cargo pgrx init "--pg$PG" "$PG_CONFIG"
+
+      - name: Install pgjinja
+        run: |
+          git clone https://github.com/thejens/pgjinja "$RUNNER_TEMP/pgjinja"
+          cd "$RUNNER_TEMP/pgjinja"
+          git checkout "$PGJINJA_REV"
+          cargo pgrx install --release --pg-config "$PG_CONFIG" --no-default-features --features "pg$PG"
+
+      - name: Lint
+        if: matrix.pg == 18
+        run: |
+          cargo fmt --all --check
+          cargo clippy -p pg_dbinja --no-default-features --features "pg$PG pg_test" --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo pgrx test "pg$PG" -p pg_dbinja
+
+  core-and-sqlite:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The end-to-end tests load the extension into each platform's own
+          # SQLite, the way users do. Ubuntu 22.04 ships SQLite 3.37.2, the
+          # oldest version the extension supports (see sqlite-headers/).
+          - { name: "Ubuntu 22.04 (SQLite 3.37)", os: ubuntu-22.04, python: /usr/bin/python3 }
+          - { name: "Ubuntu 24.04 (SQLite 3.45)", os: ubuntu-24.04, python: /usr/bin/python3 }
+          # Homebrew's Python: the python.org and setup-python builds for
+          # macOS cannot load SQLite extensions.
+          - { name: "macOS (Homebrew SQLite)", os: macos-15, python: brew }
+          - { name: "Windows (python.org SQLite)", os: windows-2025, python: setup }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # -p: the Postgres crate needs pgrx and a Postgres install to build.
+      - name: Clippy
+        run: cargo clippy -p dbinja-core -p sqlite_dbinja --all-targets -- -D warnings
+
+      - name: Core tests
+        run: cargo test -p dbinja-core
+
+      - name: Build SQLite extension
+        run: cargo build --release -p sqlite_dbinja
+
+      - uses: actions/setup-python@v5
+        if: matrix.python == 'setup'
+        with:
+          python-version: "3.13"
+
+      - name: Select Python
+        shell: bash
+        run: |
+          case "${{ matrix.python }}" in
+            brew)  brew install python@3.13 >/dev/null; echo "PYTHON=$(brew --prefix python@3.13)/bin/python3.13" >> "$GITHUB_ENV" ;;
+            setup) echo "PYTHON=python" >> "$GITHUB_ENV" ;;
+            *)     echo "PYTHON=${{ matrix.python }}" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: End-to-end tests (extension loaded into the platform's SQLite)
+        shell: bash
+        run: |
+          "$PYTHON" -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          "$PYTHON" -m unittest discover -s crates/sqlite_dbinja/tests -v
