@@ -33,6 +33,51 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
             }
         }
     }
+    // dbt 1.9's YAML snapshots name a `relation:` instead of a SELECT.
+    let yaml_snapshots: Vec<(String, String, NodeFile)> = session
+        .project
+        .properties
+        .snapshots
+        .iter()
+        .filter_map(|(name, props)| {
+            let relation = props.relation.clone()?;
+            Some((
+                name.clone(),
+                relation,
+                session.project.declared_in(&props.file, name),
+            ))
+        })
+        .collect();
+    for (name, relation, file) in yaml_snapshots {
+        if let Some((_, sql)) = snapshots.iter().find(|(n, _)| *n == name) {
+            return Err(Error::new(format!(
+                "{}: snapshot {name:?} is defined both here and in {}",
+                file.path, sql.path
+            )));
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(Error::new(format!(
+                "{}: snapshot name {name:?} must be letters, digits and underscores",
+                file.path
+            )));
+        }
+        let relation = relation.trim();
+        let is_call = (relation.starts_with("ref(") || relation.starts_with("source("))
+            && relation.ends_with(')');
+        if !is_call {
+            return Err(Error::new(format!(
+                "{}: snapshot {name:?}: relation must be a ref() or source() call, not {relation:?}",
+                file.path
+            )));
+        }
+        session.env.add_template_owned(
+            format!("{project_name}.snapshot_{name}"),
+            format!("{{% snapshot {name} %}}select * from {{{{ {relation} }}}}{{% endsnapshot %}}"),
+            Some(file.path.clone()),
+        )?;
+        snapshots.push((name, file));
+    }
+
     let p = &session.project;
     let mut declared: Vec<(ResourceType, String, NodeFile)> = Vec::new();
     declared.extend(

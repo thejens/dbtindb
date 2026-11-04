@@ -329,3 +329,45 @@ fn tests_that_store_failures_get_audit_relations() {
         "\"unique_orders_id\""
     );
 }
+
+#[test]
+fn yaml_snapshots_snapshot_a_ref_or_source() {
+    let yml = |relation: &str| {
+        format!(
+            "snapshots:\n  - name: snap\n    relation: \"{relation}\"\n    \
+             config: {{unique_key: id, strategy: check, check_cols: all}}\n"
+        )
+    };
+    let ok = yml("ref('m')");
+    let s = load(
+        &[("models/m.sql", "select 1 as id"), ("snapshots/s.yml", &ok)],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let snap = &s.manifest.nodes["snapshot.dbtindb.snap"];
+    assert!(snap.depends_on.contains("model.dbtindb.m"));
+    assert_eq!(snap.path, "snapshots/s.yml");
+    let bad = yml("analytics.m");
+    let err = load(&[("snapshots/s.yml", &bad)], Dialect::Postgres)
+        .err()
+        .unwrap();
+    assert!(err.0.contains("must be a ref() or source() call"), "{err}");
+    let err = load(
+        &[
+            ("models/m.sql", "select 1 as id"),
+            ("snapshots/s.yml", &ok),
+            (
+                "snapshots/snap.sql",
+                "{% snapshot snap %}select 1 as id{% endsnapshot %}",
+            ),
+        ],
+        Dialect::Postgres,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.0
+            .contains("defined both here and in snapshots/snap.sql"),
+        "{err}"
+    );
+}

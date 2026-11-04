@@ -157,6 +157,32 @@ fn scope_vars(settings: &mut Settings, packages: &BTreeMap<String, Package>) {
 }
 
 /// The node file at `path`, if it lies under one of `roots`.
+impl Project {
+    /// The node a property file declares by name, such as a YAML snapshot,
+    /// placed in the folder tree of the property file.
+    pub fn declared_in(&self, path: &str, name: &str) -> NodeFile {
+        let s = &self.settings;
+        let roots: Vec<String> = [
+            &s.model_paths,
+            &s.seed_paths,
+            &s.snapshot_paths,
+            &s.test_paths,
+            &s.analysis_paths,
+            &s.macro_paths,
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+        let dirs = under(&roots, path).map(|f| f.dirs).unwrap_or_default();
+        NodeFile {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            dirs,
+        }
+    }
+}
+
 fn under(roots: &[String], path: &str) -> Option<NodeFile> {
     roots.iter().find_map(|root| {
         let rest = path.strip_prefix(root.as_str())?.strip_prefix('/')?;

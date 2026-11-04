@@ -330,6 +330,39 @@ mod tests {
     }
 
     #[pg_test]
+    fn yaml_snapshots_record_deletes() {
+        Spi::run(
+            "CREATE TABLE people (id int, name text, updated_at timestamp);
+             INSERT INTO people VALUES (1, 'ada', '2024-01-01'), (2, 'bob', '2024-01-01')",
+        )
+        .unwrap();
+        file(
+            "snapshots/people.yml",
+            "sources:\n  - name: raw\n    schema: public\n    tables: [{name: people}]\n\
+             snapshots:\n  - name: people_snap\n    relation: source('raw', 'people')\n    config:\n      \
+             unique_key: id\n      strategy: timestamp\n      updated_at: updated_at\n      hard_deletes: new_record\n",
+        );
+        Spi::run("SELECT * FROM dbtindb_snapshot()").unwrap();
+        Spi::run("DELETE FROM people WHERE id = 2").unwrap();
+        Spi::run("SELECT * FROM dbtindb_snapshot()").unwrap();
+        Spi::run("SELECT * FROM dbtindb_snapshot()").unwrap();
+        assert_eq!(
+            text(
+                "SELECT string_agg(id || dbt_is_deleted || (dbt_valid_to IS NULL), ',' ORDER BY id, dbt_valid_from)
+                 FROM public.people_snap"
+            ),
+            "1Falsetrue,2Falsefalse,2Truetrue"
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM public.people_snap a JOIN public.people_snap b USING (id)
+                 WHERE a.dbt_is_deleted = 'False' AND b.dbt_is_deleted = 'True' AND a.dbt_valid_to = b.dbt_valid_from"
+            ),
+            1
+        );
+    }
+
+    #[pg_test]
     fn refreshes_materialized_views_until_their_query_changes() {
         Spi::run("CREATE TABLE src (id int); INSERT INTO src VALUES (1)").unwrap();
         file(

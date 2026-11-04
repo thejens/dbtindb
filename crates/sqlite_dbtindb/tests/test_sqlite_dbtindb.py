@@ -347,6 +347,31 @@ class SnapshotTest(unittest.TestCase):
             [("ada", 0), ("grace", 1)],
         )
 
+    def test_yaml_snapshot_recording_deletes(self):
+        conn = connect()
+        conn.executescript("CREATE TABLE people (id INTEGER, name TEXT); INSERT INTO people VALUES (1, 'ada'), (2, 'bob');")
+        put(conn, {
+            "models/people_src.sql": "select * from people",
+            "snapshots/people.yml": "snapshots:\n  - name: people_snap\n    relation: ref('people_src')\n    config:\n"
+                                    "      unique_key: id\n      strategy: check\n      check_cols: all\n      hard_deletes: new_record\n",
+        })
+        call(conn, "dbtindb_build")
+        conn.execute("DELETE FROM people WHERE id = 2")
+        call(conn, "dbtindb_snapshot")
+        conn.execute("INSERT INTO people VALUES (2, 'bob')")
+        call(conn, "dbtindb_snapshot")
+        call(conn, "dbtindb_snapshot")
+        rows = conn.execute(
+            "SELECT id, dbt_is_deleted, dbt_valid_to IS NULL FROM people_snap ORDER BY id, dbt_valid_from, dbt_is_deleted"
+        ).fetchall()
+        self.assertEqual(rows, [(1, "False", 1), (2, "False", 0), (2, "True", 0), (2, "False", 1)])
+        # The deletion closes the old version exactly when it starts.
+        (gap,) = conn.execute(
+            "SELECT count(*) FROM people_snap a JOIN people_snap b ON b.id = a.id "
+            "WHERE a.dbt_is_deleted = 'False' AND b.dbt_is_deleted = 'True' AND a.dbt_valid_to = b.dbt_valid_from"
+        ).fetchone()
+        self.assertEqual(gap, 1)
+
 
 class ContextTest(unittest.TestCase):
     def test_hooks_run_query_and_log(self):

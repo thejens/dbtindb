@@ -27,6 +27,9 @@ pub struct ResourceProps {
     pub columns: Vec<ColumnProps>,
     /// Tests on the whole resource (not on one column).
     pub tests: Vec<TestDef>,
+    /// A YAML snapshot's `relation:`, the `ref()` or `source()` it
+    /// snapshots.
+    pub relation: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -76,7 +79,10 @@ impl Properties {
             ("analyses", &mut self.analyses),
         ] {
             for entry in list(doc.get(key), &ctx(key))? {
-                let props = resource(path, entry)?;
+                let mut props = resource(path, entry)?;
+                if key == "snapshots" {
+                    props.relation = optional_string(entry, "relation")?;
+                }
                 let name = string(entry, "name", &ctx(key))?;
                 if let Some(prev) = target.insert(name.clone(), props) {
                     return Err(Error::new(format!(
@@ -141,6 +147,7 @@ fn resource(path: &str, entry: &Value) -> Result<ResourceProps, Error> {
         },
         columns,
         tests: tests(entry, &where_)?,
+        relation: None,
     })
 }
 
