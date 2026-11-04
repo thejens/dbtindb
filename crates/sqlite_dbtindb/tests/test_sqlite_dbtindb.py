@@ -215,6 +215,28 @@ class BuildTest(unittest.TestCase):
         (sql,) = conn.execute("SELECT dbtindb_compile('customers')").fetchone()
         self.assertTrue(sql.startswith('with "__dbt__cte__paid_orders" as ('), sql)
 
+    def test_inline_sql_and_views(self):
+        conn = shop()
+        call(conn, "dbtindb_build")
+        (sql,) = conn.execute(
+            "SELECT dbtindb_sql(?, ?)",
+            ("select count(*) from {{ ref('customers') }} where total_cents > {{ var('min') }}", '{"vars": {"min": 1000}}'),
+        ).fetchone()
+        self.assertEqual(sql, 'select count(*) from "customers" where total_cents > 1000')
+        # Ephemeral models are inlined, as in a model.
+        (sql,) = conn.execute("SELECT dbtindb_view('paid', 'select * from {{ ref(\"paid_orders\") }}')").fetchone()
+        self.assertTrue(sql.startswith('with "__dbt__cte__paid_orders" as ('), sql)
+        self.assertEqual(conn.execute("SELECT count(*) FROM paid").fetchone(), (3,))
+        self.assertEqual(conn.execute("SELECT type FROM temp.sqlite_master WHERE name = 'paid'").fetchone(), ("view",))
+        # A query that fails to render or to parse keeps the previous view.
+        with self.assertRaisesRegex(sqlite3.OperationalError, "nope"):
+            conn.execute("SELECT dbtindb_view('paid', 'select * from {{ ref(\"nope\") }}')")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "syntax error"):
+            conn.execute("SELECT dbtindb_view('paid', 'select from from {{ ref(\"customers\") }}')")
+        self.assertEqual(conn.execute("SELECT count(*) FROM paid").fetchone(), (3,))
+        conn.execute("SELECT dbtindb_view('paid', 'select 1 as a, 2 as b')")
+        self.assertEqual(conn.execute("SELECT b FROM paid").fetchone(), (2,))
+
     def test_failing_tests(self):
         conn = shop()
         # A duplicate order id, and a customer from a country the

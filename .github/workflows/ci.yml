@@ -82,13 +82,13 @@ jobs:
 
       # -p: the Postgres crate needs pgrx and a Postgres install to build.
       - name: Clippy
-        run: cargo clippy -p dbtindb-core -p sqlite_dbtindb --all-targets -- -D warnings
+        run: cargo clippy -p dbtindb-core -p dbtindb-cli -p sqlite_dbtindb --all-targets -- -D warnings
 
-      - name: Core tests
-        run: cargo test -p dbtindb-core
+      - name: Core and CLI tests
+        run: cargo test -p dbtindb-core -p dbtindb-cli
 
-      - name: Build SQLite extension
-        run: cargo build --release -p sqlite_dbtindb
+      - name: Build SQLite extension and CLI
+        run: cargo build --release -p sqlite_dbtindb -p dbtindb-cli
 
       - uses: actions/setup-python@v5
         if: matrix.python == 'setup'
@@ -104,7 +104,7 @@ jobs:
             *)     echo "PYTHON=${{ matrix.python }}" >> "$GITHUB_ENV" ;;
           esac
 
-      - name: End-to-end tests (extension loaded into the platform's SQLite)
+      - name: End-to-end tests (extension loaded into the platform's SQLite, CLI)
         shell: bash
         run: |
           "$PYTHON" -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'

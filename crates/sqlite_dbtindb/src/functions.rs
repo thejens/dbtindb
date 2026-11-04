@@ -34,7 +34,7 @@ pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
     // generated columns, where whoever can write the schema could make
     // other users run them.
     let flags = ffi::SQLITE_UTF8 | ffi::SQLITE_DIRECTONLY;
-    let functions: [(&CStr, &[c_int], Impl); 8] = [
+    let functions: [(&CStr, &[c_int], Impl); 10] = [
         (c"dbtindb_build", &[0, 1], |c| command(c, Command::Build)),
         (c"dbtindb_run", &[0, 1], |c| command(c, Command::Run)),
         (c"dbtindb_seed", &[0, 1], |c| command(c, Command::Seed)),
@@ -44,6 +44,8 @@ pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
         (c"dbtindb_test", &[0, 1], |c| command(c, Command::Test)),
         (c"dbtindb_ls", &[0, 1], ls),
         (c"dbtindb_compile", &[1, 2], compile),
+        (c"dbtindb_sql", &[1, 2], sql),
+        (c"dbtindb_view", &[2, 3], view),
         (c"dbtindb_md5", &[1], md5),
     ];
     for (name, arities, f) in functions {
@@ -112,6 +114,44 @@ fn compile(call: &Call<'_>) -> Result<String, Error> {
     let inv = Invocation::parse(text_arg(call, 1, "options")?)?;
     let (session, _) = load(call.db(), &inv)?;
     dbtindb_core::compile(&session, name)
+}
+
+/// `dbtindb_sql(sql [, options])`: ad-hoc SQL with `ref`, `source`, macros
+/// and vars, rendered against the project, like `dbt compile --inline`.
+fn sql(call: &Call<'_>) -> Result<String, Error> {
+    let sql = text_arg(call, 0, "sql")?.ok_or_else(|| Error::new("dbtindb_sql needs SQL"))?;
+    let inv = Invocation::parse(text_arg(call, 1, "options")?)?;
+    let (session, _) = load(call.db(), &inv)?;
+    dbtindb_core::compile_inline(&session, sql)
+}
+
+/// `dbtindb_view(name, sql [, options])`: creates (or replaces) the
+/// temporary view `name` over SQL rendered like `dbtindb_sql`, which is
+/// how the sqlite3 shell can query a dbt template. Returns the SQL.
+fn view(call: &Call<'_>) -> Result<String, Error> {
+    let name =
+        text_arg(call, 0, "name")?.ok_or_else(|| Error::new("dbtindb_view needs a view name"))?;
+    let sql = text_arg(call, 1, "sql")?.ok_or_else(|| Error::new("dbtindb_view needs SQL"))?;
+    let inv = Invocation::parse(text_arg(call, 2, "options")?)?;
+    let raw = call.db();
+    let (session, _) = load(raw, &inv)?;
+    let rendered = dbtindb_core::compile_inline(&session, sql)?;
+    let view = Dialect::Sqlite.quote(name);
+    // In a savepoint, so a query that fails to compile keeps the old view;
+    // qualified with temp, so only ever a temporary view is replaced.
+    raw.exec("SAVEPOINT dbtindb_view").map_err(Error::new)?;
+    let created = raw.exec(&format!(
+        "DROP VIEW IF EXISTS temp.{view};\nCREATE TEMP VIEW {view} AS\n{rendered}"
+    ));
+    let end = match &created {
+        Ok(()) => raw.exec("RELEASE dbtindb_view"),
+        Err(_) => raw
+            .exec("ROLLBACK TO dbtindb_view")
+            .and_then(|()| raw.exec("RELEASE dbtindb_view")),
+    };
+    created.map_err(Error::new)?;
+    end.map_err(Error::new)?;
+    Ok(rendered)
 }
 
 fn md5(call: &Call<'_>) -> Result<String, Error> {

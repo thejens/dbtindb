@@ -171,6 +171,11 @@ pub fn compile(session: &Session, name: &str) -> Result<String, Error> {
     session.compile(&node.unique_id, incremental)
 }
 
+/// Ad-hoc SQL rendered against the project, like `dbt compile --inline`.
+pub fn compile_inline(session: &Session, sql: &str) -> Result<String, Error> {
+    session.compile_inline(sql)
+}
+
 /// Steps as JSON objects.
 pub fn steps_json(steps: &[Step]) -> Value {
     Value::Array(

@@ -167,6 +167,57 @@ fn dbtindb_compile(
         .unwrap_or_else(|e| error!("dbtindb: {e}"))
 }
 
+/// `dbt compile --inline`: ad-hoc SQL with `ref`, `source`, macros and
+/// vars, rendered against the project. psql's `\gexec` runs the result as
+/// if it had been typed in:
+///
+/// ```sql
+/// SELECT dbtindb_sql($$select * from {{ ref('customers') }}$$) \gexec
+/// ```
+#[pg_extern(volatile, parallel_unsafe)]
+fn dbtindb_sql(
+    sql: &str,
+    vars: default!(JsonB, "'{}'::jsonb"),
+    target_schema: default!(&str, "'public'"),
+) -> String {
+    load(&vars.0, target_schema)
+        .and_then(|session| dbtindb_core::compile_inline(&session, sql))
+        .unwrap_or_else(|e| error!("dbtindb: {e}"))
+}
+
+/// Creates (or replaces) the temporary view `name` over ad-hoc SQL rendered
+/// like [`dbtindb_sql`], for clients without `\gexec`. Returns the SQL.
+#[pg_extern(volatile, parallel_unsafe)]
+fn dbtindb_view(
+    name: &str,
+    sql: &str,
+    vars: default!(JsonB, "'{}'::jsonb"),
+    target_schema: default!(&str, "'public'"),
+) -> String {
+    let rendered = load(&vars.0, target_schema)
+        .and_then(|session| dbtindb_core::compile_inline(&session, sql))
+        .unwrap_or_else(|e| error!("dbtindb: {e}"));
+    let view = Dialect::Postgres.quote(name);
+    // Looked up first: before a session's first temporary object, even
+    // DROP VIEW IF EXISTS pg_temp.x complains that pg_temp does not exist.
+    let exists = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS (SELECT FROM pg_catalog.pg_class
+          WHERE relnamespace = pg_catalog.pg_my_temp_schema() AND relname = $1 AND relkind = 'v')",
+        &[name.into()],
+    )
+    .unwrap_or_else(|e| error!("dbtindb: {e}"))
+    .unwrap_or(false);
+    // Qualified with pg_temp, so only ever a temporary view is replaced.
+    let drop = if exists {
+        format!("DROP VIEW pg_temp.{view};\n")
+    } else {
+        String::new()
+    };
+    Spi::run(&format!("{drop}CREATE TEMP VIEW {view} AS\n{rendered}"))
+        .unwrap_or_else(|e| error!("dbtindb: {e}"));
+    rendered
+}
+
 /// Loads the project from `dbtindb_files`.
 fn load(vars: &serde_json::Value, schema: &str) -> Result<Session, Error> {
     let db = Arc::new(PgDb::new()?);

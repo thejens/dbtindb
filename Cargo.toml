@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dbtindb-core", "crates/pg_dbtindb", "crates/sqlite_dbtindb"]
+members = ["crates/dbtindb-core", "crates/dbtindb-cli", "crates/pg_dbtindb", "crates/sqlite_dbtindb"]
 
 [workspace.package]
 version = "0.1.0"

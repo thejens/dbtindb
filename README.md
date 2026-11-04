@@ -42,6 +42,8 @@ SELECT step, name, action, status FROM dbtindb_build(target_schema => 'analytics
 - **dbt project files:** `dbt_project.yml` with folder-level `+config`, property YAML files, `vars`, hooks, `generate_schema_name`/`generate_alias_name` overrides and `adapter.dispatch`.
 - **Atomic builds:** a command runs in one transaction. If a model or an error-severity test fails, nothing changes.
 - **Safe rebuilds:** dbtindb only replaces relations it created and never uses `CASCADE`. Your own views on top of a model block its rebuild instead of disappearing.
+- **Ad-hoc dbt SQL from psql and sqlite3:** `SELECT dbtindb_sql($$select * from {{ ref('customers') }}$$) \gexec` runs a dbt-templated query as if you had typed the compiled SQL.
+- **A loader CLI:** `dbtindb load ./my_project --dialect postgres | psql` copies a dbt project from disk into the database.
 - **Two databases, one project:** the same files build in PostgreSQL (as an extension built with [pgrx](https://github.com/pgcentralfoundation/pgrx)) and in SQLite (as a loadable extension).
 
 dbtindb is the dbt-shaped sibling of [pgjinja](https://github.com/thejens/pgjinja) and [sqlite-jinja](https://github.com/thejens/sqlite-jinja), which render plain Jinja2 templates in SQL.
@@ -52,6 +54,7 @@ dbtindb is the dbt-shaped sibling of [pgjinja](https://github.com/thejens/pgjinj
 - [Installation](#installation)
 - [Writing a project](#writing-a-project)
 - [Commands](#commands)
+- [Ad-hoc dbt SQL](#ad-hoc-dbt-sql)
 - [PostgreSQL](#postgresql)
 - [SQLite](#sqlite)
 - [What is supported from dbt](#what-is-supported-from-dbt)
@@ -100,7 +103,12 @@ cargo build --release -p sqlite_dbtindb
 
 ```sql
 .load ./target/release/libsqlite_dbtindb
-CREATE TABLE dbtindb_files (path TEXT PRIMARY KEY, source TEXT NOT NULL);
+```
+
+**The `dbtindb` CLI**, which loads projects from disk:
+
+```sh
+cargo install --path crates/dbtindb-cli   # from the clone; installs `dbtindb`
 ```
 
 ## Writing a project
@@ -131,16 +139,18 @@ where customer_id in (select customer_id from {{ ref('stg_orders') }} where orde
 group by 1
 ```
 
-To load an existing dbt project from disk, insert each file under its path relative to the project root. With the `sqlite3` CLI, which has a `readfile()` function:
+### Loading a project from disk
+
+`dbtindb load` reads a dbt project directory and prints a SQL script that loads it, which you pipe into the database's own client. The CLI never connects to a database, so connection strings, `.pgpass`, SSH tunnels and SQLite paths work as they always do:
 
 ```sh
-cd my_dbt_project
-find dbt_project.yml models seeds snapshots tests macros -type f | while read -r f; do
-  sqlite3 ../app.db "INSERT OR REPLACE INTO dbtindb_files VALUES ('$f', CAST(readfile('$f') AS TEXT))"
-done
+dbtindb load ./jaffle_shop --dialect postgres | psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+dbtindb load ./jaffle_shop --dialect sqlite | sqlite3 app.db
 ```
 
-With `psql`, `\set content `cat models/x.sql`` followed by `INSERT ... VALUES ('models/x.sql', :'content')` does the same.
+It takes `dbt_project.yml` and the `.sql`, `.yml`, `.yaml` and `.csv` files under the project's model, seed, snapshot, test and macro paths (as `dbt_project.yml` sets them), skipping hidden files, `target/` and anything else. The script runs in one transaction. By default it replaces the table's contents, so files deleted on disk disappear from the database; `--merge` only inserts and updates. `--table` loads into a schema-qualified table when the extension's schema is not on the `search_path`. The PostgreSQL script uses dollar quoting, so backslashes, quotes and `:psql_variables` in your files arrive unchanged.
+
+You can also write the rows yourself: a path is a file's path relative to the project root. The PostgreSQL extension creates `dbtindb_files`; on SQLite, `dbtindb load` creates it, or you run `CREATE TABLE dbtindb_files (path TEXT PRIMARY KEY, source TEXT NOT NULL)`.
 
 ## Commands
 
@@ -158,6 +168,27 @@ Every command takes a selector (`--select`), an exclusion (`--exclude`), `vars` 
 
 Selection follows dbt: space-separated items are a union and commas intersect. Graph operators are `+`, `n+`, `+n` and `@`. The selector methods are `fqn` (the default), `path`/`file`, `tag`, `resource_type`, `package`, `test_type`, `test_name`, `config.<key>` and `source`. Tests whose parents are all selected are included, as with dbt's default eager indirect selection.
 
+## Ad-hoc dbt SQL
+
+`dbtindb_sql(sql)` renders any SQL with the project's `ref`, `source`, macros and `var`s, like `dbt compile --inline`. Ephemeral models become CTEs. psql's `\gexec` then runs the result as an ordinary query, so you can write dbt templates at the `psql` prompt and get normal result tables:
+
+```sql
+SELECT dbtindb_sql($$
+  select country_name, sum(total_cents) / 100.0 as revenue
+  from {{ ref('customers') }}
+  group by 1
+$$) \gexec
+```
+
+The sqlite3 shell has no `\gexec`, so `dbtindb_view(name, sql)` creates (or replaces) a temporary view over the rendered SQL instead. Inside SQLite's single-quoted strings, use Jinja's double quotes:
+
+```sql
+SELECT dbtindb_view('q', 'select * from {{ ref("customers") }} where total_cents > 1000');
+SELECT * FROM q;
+```
+
+`dbtindb_view` is also on PostgreSQL, for clients without `\gexec`. Both functions return the rendered SQL. `dbtindb_view` only ever drops a temporary view of that name, and if the new query fails, the old view is kept.
+
 ## PostgreSQL
 
 ```sql
@@ -172,6 +203,9 @@ dbtindb_ls(selector text = NULL, exclude text = NULL, vars jsonb = '{}', target_
                 relation text, path text, depends_on text[], sources text[], tags text[])
 
 dbtindb_compile(name text, vars jsonb = '{}', target_schema text = 'public') RETURNS text
+
+dbtindb_sql(sql text, vars jsonb = '{}', target_schema text = 'public') RETURNS text
+dbtindb_view(name text, sql text, vars jsonb = '{}', target_schema text = 'public') RETURNS text
 ```
 
 ```sql
@@ -198,6 +232,8 @@ SQLite functions return a single value, so results are JSON that you can query w
 | `dbtindb_build([options])`, `dbtindb_run`, `dbtindb_seed`, `dbtindb_snapshot`, `dbtindb_test` | `{"steps": [...], "logs": [...]}`; each step is an object with the columns above, and `logs` holds `log()` and `exceptions.warn()` messages |
 | `dbtindb_ls([options])` | A JSON array of nodes |
 | `dbtindb_compile(name [, options])` | The compiled SQL |
+| `dbtindb_sql(sql [, options])` | Ad-hoc SQL rendered against the project |
+| `dbtindb_view(name, sql [, options])` | Creates the temporary view `name` over the rendered SQL, and returns that SQL |
 
 ```sql
 SELECT json_extract(value, '$.name'), json_extract(value, '$.status')
@@ -273,12 +309,15 @@ cargo test -p dbtindb-core
 # PostgreSQL extension, in a pgrx-managed Postgres
 cargo pgrx test pg16 -p pg_dbtindb
 
-# SQLite extension, end to end through Python's sqlite3
-cargo build --release -p sqlite_dbtindb
+# CLI
+cargo test -p dbtindb-cli
+
+# SQLite extension and CLI, end to end through Python's sqlite3
+cargo build --release -p sqlite_dbtindb -p dbtindb-cli
 python3 -m unittest discover -s crates/sqlite_dbtindb/tests -v
 ```
 
-The workspace has three crates. `dbtindb-core` holds the dbt semantics: the project, the Jinja context, selection, the DAG and the materializations. It drives the database through a small `Database` trait. `pg_dbtindb` (over SPI) and `sqlite_dbtindb` (over the SQLite C API) implement that trait and expose the SQL functions.
+The workspace has four crates. `dbtindb-core` holds the dbt semantics: the project, the Jinja context, selection, the DAG and the materializations. It drives the database through a small `Database` trait. `pg_dbtindb` (over SPI) and `sqlite_dbtindb` (over the SQLite C API) implement that trait and expose the SQL functions. `dbtindb-cli` is the `dbtindb` command.
 
 ## License
 
