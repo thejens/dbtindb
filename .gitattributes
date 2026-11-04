@@ -1,0 +1,3 @@
+# Embedded with include_str!: their text is the SQL dbtindb renders, so it
+# must not depend on the platform the crate is checked out on.
+crates/dbtindb-core/dbt-macros/** text eol=lf
