@@ -1,0 +1,6 @@
+comment = 'dbtindb: build dbt-style Jinja SQL models inside PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_dbtindb'
+relocatable = false
+superuser = true
+trusted = false

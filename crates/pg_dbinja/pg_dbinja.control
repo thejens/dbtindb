@@ -1,7 +1,0 @@
-comment = 'dbinja: build dbt-style Jinja SQL models inside PostgreSQL'
-default_version = '@CARGO_VERSION@'
-module_pathname = 'pg_dbinja'
-relocatable = false
-superuser = true
-trusted = false
-requires = 'pgjinja'

@@ -1,0 +1,27 @@
+[package]
+name = "pg_dbtindb"
+description = "dbtindb for PostgreSQL: build, test and snapshot a dbt project inside the database."
+edition = "2021"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg16"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+[dependencies]
+dbtindb-core = { path = "../dbtindb-core" }
+pgrx = "=0.19.3"
+serde_json.workspace = true
+
+[dev-dependencies]
+pgrx-tests = "=0.19.3"

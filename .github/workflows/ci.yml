@@ -8,10 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PGRX_VERSION: 0.19.3
-  # pg_dbinja reads models from pgjinja's jinja_templates table, so the
-  # tests install pgjinja first. Pinned, so a pgjinja change cannot break
-  # this repo's CI unnoticed.
-  PGJINJA_REV: 6338f16b6181cbc401bc75c02744e13fd7cfbdf3
 
 jobs:
   postgres:
@@ -50,21 +46,14 @@ jobs:
       - name: Initialise pgrx
         run: cargo pgrx init "--pg$PG" "$PG_CONFIG"
 
-      - name: Install pgjinja
-        run: |
-          git clone https://github.com/thejens/pgjinja "$RUNNER_TEMP/pgjinja"
-          cd "$RUNNER_TEMP/pgjinja"
-          git checkout "$PGJINJA_REV"
-          cargo pgrx install --release --pg-config "$PG_CONFIG" --no-default-features --features "pg$PG"
-
       - name: Lint
         if: matrix.pg == 18
         run: |
           cargo fmt --all --check
-          cargo clippy -p pg_dbinja --no-default-features --features "pg$PG pg_test" --all-targets -- -D warnings
+          cargo clippy -p pg_dbtindb --no-default-features --features "pg$PG pg_test" --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo pgrx test "pg$PG" -p pg_dbinja
+        run: cargo pgrx test "pg$PG" -p pg_dbtindb
 
   core-and-sqlite:
     name: ${{ matrix.name }}
@@ -93,13 +82,13 @@ jobs:
 
       # -p: the Postgres crate needs pgrx and a Postgres install to build.
       - name: Clippy
-        run: cargo clippy -p dbinja-core -p sqlite_dbinja --all-targets -- -D warnings
+        run: cargo clippy -p dbtindb-core -p sqlite_dbtindb --all-targets -- -D warnings
 
       - name: Core tests
-        run: cargo test -p dbinja-core
+        run: cargo test -p dbtindb-core
 
       - name: Build SQLite extension
-        run: cargo build --release -p sqlite_dbinja
+        run: cargo build --release -p sqlite_dbtindb
 
       - uses: actions/setup-python@v5
         if: matrix.python == 'setup'
@@ -119,4 +108,4 @@ jobs:
         shell: bash
         run: |
           "$PYTHON" -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
-          "$PYTHON" -m unittest discover -s crates/sqlite_dbinja/tests -v
+          "$PYTHON" -m unittest discover -s crates/sqlite_dbtindb/tests -v

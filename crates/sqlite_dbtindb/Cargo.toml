@@ -1,0 +1,21 @@
+[package]
+name = "sqlite_dbtindb"
+description = "dbtindb for SQLite: a loadable extension that builds, tests and snapshots a dbt project inside the database."
+edition = "2024"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# Loaded at run time (`.load`, `load_extension()`); SQLite derives the entry
+# point sqlite3_sqlitedbtindb_init from the file name libsqlite_dbtindb.
+crate-type = ["cdylib"]
+
+[dependencies]
+dbtindb-core = { path = "../dbtindb-core" }
+# Talked to directly, through the routine table SQLite hands a loadable
+# extension; bindgen runs against the vendored 3.37.2 headers (see
+# sqlite-headers/README.md), which sets the minimum SQLite version.
+libsqlite3-sys = { version = "0.39.1", default-features = false, features = ["loadable_extension", "buildtime_bindgen"] }
+serde_json.workspace = true
+md-5.workspace = true
