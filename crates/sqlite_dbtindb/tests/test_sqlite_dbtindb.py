@@ -1,12 +1,12 @@
 """End-to-end tests of the built SQLite extension, through a stock SQLite.
 
-Compilation itself is unit-tested in dbinja-core; these cover what only the
+Compilation itself is unit-tested in dbtindb-core; these cover what only the
 loaded extension does: reading jinja_templates, building relations, the
 bookkeeping table and rollback.
 
-Usage: python -m unittest discover -s crates/sqlite_dbinja/tests
-       (after `cargo build --release -p sqlite_dbinja`)
-Set SQLITE_DBINJA_PATH to test a library somewhere other than target/release.
+Usage: python -m unittest discover -s crates/sqlite_dbtindb/tests
+       (after `cargo build --release -p sqlite_dbtindb`)
+Set SQLITE_DBTINDB_PATH to test a library somewhere other than target/release.
 """
 
 import json
@@ -20,7 +20,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 SUFFIX = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
 PREFIX = "" if sys.platform == "win32" else "lib"
 EXT_PATH = os.environ.get(
-    "SQLITE_DBINJA_PATH", str(ROOT / "target" / "release" / f"{PREFIX}sqlite_dbinja")
+    "SQLITE_DBTINDB_PATH", str(ROOT / "target" / "release" / f"{PREFIX}sqlite_dbtindb")
 )
 
 PROJECT = {
@@ -40,10 +40,10 @@ PROJECT = {
 
 
 def connect():
-    # Autocommit, so the tests see exactly the transactions dbinja makes.
+    # Autocommit, so the tests see exactly the transactions dbtindb makes.
     conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.enable_load_extension(True)
-    # No entry point given: SQLite must derive sqlite3_sqlitedbinja_init.
+    # No entry point given: SQLite must derive sqlite3_sqlitedbtindb_init.
     conn.load_extension(EXT_PATH)
     conn.enable_load_extension(False)
     return conn
@@ -63,7 +63,7 @@ def jaffle_shop():
 
 
 def run(conn, vars=None):
-    (out,) = conn.execute("SELECT dbinja_run(?)", (vars,)).fetchone()
+    (out,) = conn.execute("SELECT dbtindb_run(?)", (vars,)).fetchone()
     return json.loads(out)
 
 
@@ -73,10 +73,10 @@ def objects(conn):
     ).fetchall()
 
 
-class SqliteDbinjaTest(unittest.TestCase):
+class SqliteDbtindbTest(unittest.TestCase):
     def test_compiles_a_model(self):
         conn = jaffle_shop()
-        (sql,) = conn.execute("SELECT dbinja_compile('customers')").fetchone()
+        (sql,) = conn.execute("SELECT dbtindb_compile('customers')").fetchone()
         self.assertEqual(
             sql,
             "select customer_id, sum(amount_cents) as total_cents\n"
@@ -89,10 +89,10 @@ class SqliteDbinjaTest(unittest.TestCase):
         conn = jaffle_shop()
         rows = conn.execute(
             "SELECT m.value ->> 'model', m.value ->> 'materialized', m.value -> 'depends_on' "
-            "FROM json_each(dbinja_models()) AS m ORDER BY m.value ->> 'build_order'"
+            "FROM json_each(dbtindb_models()) AS m ORDER BY m.value ->> 'build_order'"
             if sqlite3.sqlite_version_info >= (3, 38)
             else "SELECT json_extract(m.value, '$.model'), json_extract(m.value, '$.materialized'), "
-            "json_extract(m.value, '$.depends_on') FROM json_each(dbinja_models()) AS m"
+            "json_extract(m.value, '$.depends_on') FROM json_each(dbtindb_models()) AS m"
         ).fetchall()
         self.assertEqual(
             rows,
@@ -122,7 +122,7 @@ class SqliteDbinjaTest(unittest.TestCase):
             (1000,),
         )
         self.assertEqual(
-            conn.execute("SELECT relation_name, path, materialized FROM dbinja_managed "
+            conn.execute("SELECT relation_name, path, materialized FROM dbtindb_managed "
                          "ORDER BY 1").fetchall(),
             [("customers", "models/customers.sql", "table"),
              ("stg_orders", "models/staging/stg_orders.sql", "view")],
@@ -132,7 +132,7 @@ class SqliteDbinjaTest(unittest.TestCase):
     def test_never_replaces_relations_it_did_not_create(self):
         conn = jaffle_shop()
         conn.execute("CREATE TABLE Customers (precious INTEGER)")
-        with self.assertRaisesRegex(sqlite3.OperationalError, "was not created by dbinja"):
+        with self.assertRaisesRegex(sqlite3.OperationalError, "was not created by dbtindb"):
             run(conn)
         self.assertIn(("table", "Customers"), objects(conn))
         self.assertNotIn(("view", "stg_orders"), objects(conn))
@@ -159,7 +159,7 @@ class SqliteDbinjaTest(unittest.TestCase):
                 conn.execute("SELECT total_cents FROM customers WHERE customer_id = 1").fetchone(),
                 (1500,),
             )
-            self.assertEqual(conn.execute("SELECT count(*) FROM dbinja_managed").fetchone(), (2,))
+            self.assertEqual(conn.execute("SELECT count(*) FROM dbtindb_managed").fetchone(), (2,))
             self.assertEqual(conn.in_transaction, begin)
 
     def test_runs_inside_the_callers_transaction(self):
@@ -168,19 +168,19 @@ class SqliteDbinjaTest(unittest.TestCase):
         run(conn)
         conn.execute("ROLLBACK")
         self.assertNotIn(("view", "stg_orders"), objects(conn))
-        self.assertNotIn(("table", "dbinja_managed"), objects(conn))
+        self.assertNotIn(("table", "dbtindb_managed"), objects(conn))
 
     def test_cannot_be_used_from_a_view(self):
         conn = jaffle_shop()
-        conn.execute("CREATE VIEW sneaky AS SELECT dbinja_run()")
-        with self.assertRaisesRegex(sqlite3.OperationalError, "unsafe use of dbinja_run"):
+        conn.execute("CREATE VIEW sneaky AS SELECT dbtindb_run()")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "unsafe use of dbtindb_run"):
             conn.execute("SELECT * FROM sneaky").fetchall()
 
     def test_a_model_cannot_run_the_build(self):
         conn = jaffle_shop()
         conn.execute(
             "INSERT INTO jinja_templates VALUES "
-            "('models/loop.sql', '{{ config(materialized=''table'') }} select dbinja_run() as x')"
+            "('models/loop.sql', '{{ config(materialized=''table'') }} select dbtindb_run() as x')"
         )
         with self.assertRaisesRegex(sqlite3.OperationalError, "cannot be called while it is running"):
             run(conn)
@@ -189,12 +189,12 @@ class SqliteDbinjaTest(unittest.TestCase):
     def test_reports_errors(self):
         conn = connect()
         with self.assertRaisesRegex(sqlite3.OperationalError, "no jinja_templates table"):
-            conn.execute("SELECT dbinja_models()").fetchone()
+            conn.execute("SELECT dbtindb_models()").fetchone()
         conn = jaffle_shop()
         with self.assertRaisesRegex(sqlite3.OperationalError, 'no enabled model named "nope"'):
-            conn.execute("SELECT dbinja_compile('nope')").fetchone()
+            conn.execute("SELECT dbtindb_compile('nope')").fetchone()
         with self.assertRaisesRegex(sqlite3.OperationalError, "vars must be a JSON object"):
-            conn.execute("SELECT dbinja_models('[1]')").fetchone()
+            conn.execute("SELECT dbtindb_models('[1]')").fetchone()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
-//! Database-agnostic core of dbinja: dbt-style models, compiled inside the
+//! Database-agnostic core of dbtindb: dbt-style models, compiled inside the
 //! database.
 //!
 //! A project is a set of named template files, exactly the rows of the
 //! `jinja_templates` table that pgjinja and sqlite-jinja render from:
 //!
-//! - `models/**/<name>.sql` are models. Each is a SELECT that dbinja
+//! - `models/**/<name>.sql` are models. Each is a SELECT that dbtindb
 //!   materializes as a view or table called `<name>`.
 //! - `macros/**/*.sql` hold macros, which every model can call without an
 //!   import, as in dbt.

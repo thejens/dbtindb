@@ -159,7 +159,7 @@ fn environment(
             [name] => name,
             [_, _] => {
                 return Err(jinja_error(
-                    "ref() with a package name is not supported: dbinja projects have no packages",
+                    "ref() with a package name is not supported: dbtindb projects have no packages",
                 ));
             }
             _ => return Err(jinja_error("ref() takes one argument: the model name")),
@@ -196,7 +196,7 @@ fn environment(
                         "table" => Materialization::Table,
                         other => {
                             return Err(jinja_error(format!(
-                                "materialized={other:?} is not supported by dbinja (use \"view\" or \"table\")"
+                                "materialized={other:?} is not supported by dbtindb (use \"view\" or \"table\")"
                             )));
                         }
                     });
@@ -207,7 +207,7 @@ fn environment(
                 }
                 other => {
                     return Err(jinja_error(format!(
-                        "config key {other:?} is not supported by dbinja"
+                        "config key {other:?} is not supported by dbtindb"
                     )));
                 }
             }
@@ -226,14 +226,14 @@ fn environment(
         }
     });
 
-    // dbinja always rebuilds models from scratch, which is exactly how dbt
+    // dbtindb always rebuilds models from scratch, which is exactly how dbt
     // treats an incremental model on a full refresh.
     env.add_function("is_incremental", || Ok::<_, minijinja::Error>(false));
 
     env.add_global(
         "target",
         Value::from_serialize(serde_json::json!({
-            "name": "dbinja",
+            "name": "dbtindb",
             "type": target.dialect.name(),
             "schema": target.schema,
         })),

@@ -1,4 +1,4 @@
-//! dbinja for PostgreSQL: dbt-style Jinja SQL models, built inside the
+//! dbtindb for PostgreSQL: dbt-style Jinja SQL models, built inside the
 //! database from pgjinja's `jinja_templates` table.
 
 use pgrx::prelude::*;
@@ -12,7 +12,7 @@ mod pg_tests;
 
 extension_sql!(
     r#"
-CREATE TABLE dbinja_managed (
+CREATE TABLE dbtindb_managed (
     schema_name   text NOT NULL,
     relation_name text NOT NULL,
     path          text NOT NULL,
@@ -20,11 +20,11 @@ CREATE TABLE dbinja_managed (
     built_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (schema_name, relation_name)
 );
-COMMENT ON TABLE dbinja_managed IS
-    'Relations created by dbinja_run(). dbinja only ever drops relations listed here.';
-SELECT pg_catalog.pg_extension_config_dump('dbinja_managed', '');
+COMMENT ON TABLE dbtindb_managed IS
+    'Relations created by dbtindb_run(). dbtindb only ever drops relations listed here.';
+SELECT pg_catalog.pg_extension_config_dump('dbtindb_managed', '');
 "#,
-    name = "dbinja_managed_table",
+    name = "dbtindb_managed_table",
 );
 
 /// Required by `cargo pgrx test`; must be visible at the crate root.

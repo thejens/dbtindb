@@ -3,9 +3,9 @@
 rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
 
 # Point libsqlite3-sys at the vendored SQLite 3.37.2 headers (see
-# crates/sqlite_dbinja/sqlite-headers/README.md). The loadable build runs
+# crates/sqlite_dbtindb/sqlite-headers/README.md). The loadable build runs
 # bindgen against sqlite3ext.h and links no SQLite library; the LIB_DIR entry
 # only makes libsqlite3-sys take the include directory from the environment.
 [env]
-SQLITE3_INCLUDE_DIR = { value = "crates/sqlite_dbinja/sqlite-headers", relative = true }
-SQLITE3_LIB_DIR = { value = "crates/sqlite_dbinja/sqlite-headers", relative = true }
+SQLITE3_INCLUDE_DIR = { value = "crates/sqlite_dbtindb/sqlite-headers", relative = true }
+SQLITE3_LIB_DIR = { value = "crates/sqlite_dbtindb/sqlite-headers", relative = true }

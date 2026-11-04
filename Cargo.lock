@@ -361,14 +361,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dbinja-core"
-version = "0.1.0"
-dependencies = [
- "minijinja",
- "serde_json",
-]
-
-[[package]]
 name = "dbt-fusion-workspace-hack"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -412,6 +404,14 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "dbtindb-core"
+version = "0.1.0"
+dependencies = [
+ "minijinja",
+ "serde_json",
 ]
 
 [[package]]
@@ -1135,10 +1135,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_dbinja"
+name = "pg_dbtindb"
 version = "0.1.0"
 dependencies = [
- "dbinja-core",
+ "dbtindb-core",
  "pgrx",
  "pgrx-tests",
  "serde_json",
@@ -1714,10 +1714,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite_dbinja"
+name = "sqlite_dbtindb"
 version = "0.1.0"
 dependencies = [
- "dbinja-core",
+ "dbtindb-core",
  "libsqlite3-sys",
  "serde_json",
 ]

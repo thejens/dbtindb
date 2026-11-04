@@ -1,6 +1,6 @@
 //! How each supported database spells relations and DDL.
 
-/// The SQL dialect of the database dbinja runs in.
+/// The SQL dialect of the database dbtindb runs in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Postgres,

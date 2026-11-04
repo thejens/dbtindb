@@ -232,7 +232,7 @@ unsafe extern "C" fn trampoline(
     };
     // A panic must not unwind into SQLite's C frames.
     let result = catch_unwind(AssertUnwindSafe(|| f(&call)))
-        .unwrap_or_else(|_| Err("internal error in dbinja (panic)".to_owned()));
+        .unwrap_or_else(|_| Err("internal error in dbtindb (panic)".to_owned()));
     // SAFETY: valid context; results are copied by SQLite (TRANSIENT).
     unsafe {
         match result {
@@ -279,11 +279,11 @@ pub unsafe fn init_api(
             compile_time,
             runtime,
         } => format!(
-            "dbinja requires SQLite {} or newer, but this is SQLite {}",
+            "dbtindb requires SQLite {} or newer, but this is SQLite {}",
             version_string(compile_time),
             version_string(runtime)
         ),
-        other => format!("dbinja could not initialise the SQLite API: {other:?}"),
+        other => format!("dbtindb could not initialise the SQLite API: {other:?}"),
     };
     // SAFETY: `mprintf` comes straight from the routine table; "%s" with a
     // valid NUL-terminated string.

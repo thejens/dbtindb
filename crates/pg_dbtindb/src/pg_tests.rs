@@ -53,7 +53,7 @@ mod tests {
     #[pg_test]
     fn compiles_a_model() {
         jaffle_shop();
-        let sql = Spi::get_one::<String>("SELECT dbinja_compile('customers', 'analytics')")
+        let sql = Spi::get_one::<String>("SELECT dbtindb_compile('customers', 'analytics')")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -71,7 +71,7 @@ mod tests {
         type Row = (i32, String, String, Vec<String>, Vec<String>);
         let rows: Vec<Row> = Spi::connect(|c| {
             c.select(
-                "SELECT build_order, model, materialized, depends_on, sources FROM dbinja_models()",
+                "SELECT build_order, model, materialized, depends_on, sources FROM dbtindb_models()",
                 None,
                 &[],
             )
@@ -111,7 +111,7 @@ mod tests {
     #[pg_test]
     fn builds_and_rebuilds_the_project() {
         jaffle_shop();
-        let steps = count("SELECT count(*) FROM dbinja_run('analytics')");
+        let steps = count("SELECT count(*) FROM dbtindb_run('analytics')");
         assert_eq!(steps, 2, "first run only creates");
         assert_eq!(
             count("SELECT total_cents FROM analytics.customers WHERE customer_id = 1"),
@@ -129,7 +129,7 @@ mod tests {
         // A second run drops dependents first, then recreates in order.
         let actions = Spi::get_one::<String>(
             "SELECT string_agg(action || ' ' || model, ', ' ORDER BY step)
-               FROM dbinja_run('analytics', '{\"min_cents\": 600}')",
+               FROM dbtindb_run('analytics', '{\"min_cents\": 600}')",
         )
         .unwrap()
         .unwrap();
@@ -142,7 +142,7 @@ mod tests {
             1000
         );
         assert_eq!(
-            count("SELECT count(*) FROM dbinja_managed WHERE schema_name = 'analytics'"),
+            count("SELECT count(*) FROM dbtindb_managed WHERE schema_name = 'analytics'"),
             2
         );
     }
@@ -152,36 +152,36 @@ mod tests {
         jaffle_shop();
         Spi::run("CREATE SCHEMA analytics; CREATE TABLE analytics.customers (precious int)")
             .unwrap();
-        let err = error_of("SELECT * FROM dbinja_run('analytics')");
-        assert!(err.contains("was not created by dbinja"), "{err}");
+        let err = error_of("SELECT * FROM dbtindb_run('analytics')");
+        assert!(err.contains("was not created by dbtindb"), "{err}");
         assert_eq!(count("SELECT count(*) FROM information_schema.columns WHERE table_name = 'customers' AND column_name = 'precious'"), 1);
     }
 
     #[pg_test]
     fn a_failing_model_changes_nothing() {
         jaffle_shop();
-        Spi::run("SELECT * FROM dbinja_run('analytics')").unwrap();
+        Spi::run("SELECT * FROM dbtindb_run('analytics')").unwrap();
         template(
             "models/broken.sql",
             "select * from {{ ref('customers') }} where nope",
         );
         // Different vars, so that customers would hold different totals had
         // its rebuild survived the failure.
-        let err = error_of(r#"SELECT * FROM dbinja_run('analytics', '{"min_cents": 600}')"#);
+        let err = error_of(r#"SELECT * FROM dbtindb_run('analytics', '{"min_cents": 600}')"#);
         assert!(err.contains("nope"), "{err}");
         assert_eq!(
             count("SELECT total_cents FROM analytics.customers WHERE customer_id = 1"),
             1500
         );
-        assert_eq!(count("SELECT count(*) FROM dbinja_managed"), 2);
+        assert_eq!(count("SELECT count(*) FROM dbtindb_managed"), 2);
     }
 
     #[pg_test]
     fn dependents_that_are_not_models_block_the_rebuild() {
         jaffle_shop();
-        Spi::run("SELECT * FROM dbinja_run('analytics')").unwrap();
+        Spi::run("SELECT * FROM dbtindb_run('analytics')").unwrap();
         Spi::run("CREATE VIEW public.report AS SELECT * FROM analytics.customers").unwrap();
-        let err = error_of("SELECT * FROM dbinja_run('analytics')");
+        let err = error_of("SELECT * FROM dbtindb_run('analytics')");
         assert!(err.contains("depend"), "{err}");
         assert_eq!(count("SELECT count(*) FROM public.report"), 2);
     }
@@ -190,10 +190,10 @@ mod tests {
     fn reports_compile_errors() {
         template("models/a.sql", "select * from {{ ref('b') }}");
         template("models/b.sql", "select * from {{ ref('a') }}");
-        let err = error_of("SELECT * FROM dbinja_models()");
+        let err = error_of("SELECT * FROM dbtindb_models()");
         assert!(err.contains("dependency cycle: a -> b -> a"), "{err}");
 
-        let err = error_of("SELECT dbinja_compile('missing')");
+        let err = error_of("SELECT dbtindb_compile('missing')");
         assert!(err.contains("no enabled model named \"missing\""), "{err}");
     }
 
@@ -201,7 +201,7 @@ mod tests {
     fn rejects_identifiers_postgres_would_truncate() {
         let long = "x".repeat(64);
         template(&format!("models/{long}.sql"), "select 1");
-        let err = error_of("SELECT * FROM dbinja_models()");
+        let err = error_of("SELECT * FROM dbtindb_models()");
         assert!(err.contains("63-byte identifier limit"), "{err}");
     }
 }

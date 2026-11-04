@@ -1,11 +1,11 @@
-# dbinja: run dbt models inside PostgreSQL and SQLite
+# dbtindb: run dbt models inside PostgreSQL and SQLite
 
-[![CI](https://github.com/thejens/dbinja/actions/workflows/ci.yml/badge.svg)](https://github.com/thejens/dbinja/actions/workflows/ci.yml)
+[![CI](https://github.com/thejens/dbtindb/actions/workflows/ci.yml/badge.svg)](https://github.com/thejens/dbtindb/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![PostgreSQL 14–18 | SQLite 3.37+](https://img.shields.io/badge/PostgreSQL%2014–18%20%7C%20SQLite%203.37%2B-lightgrey)
 
-**dbinja runs dbt-style SQL models inside the database.**
-You store the models as rows, and `SELECT dbinja_run()` compiles them and builds every view and table in dependency order. There is no Python, no dbt CLI and no orchestrator to run.
+**dbtindb runs dbt-style SQL models inside the database.**
+You store the models as rows, and `SELECT dbtindb_run()` compiles them and builds every view and table in dependency order. There is no Python, no dbt CLI and no orchestrator to run.
 
 ```sql
 INSERT INTO jinja_templates (name, source) VALUES
@@ -18,7 +18,7 @@ INSERT INTO jinja_templates (name, source) VALUES
      from {{ ref('stg_orders') }}
      group by 1$$);
 
-SELECT * FROM dbinja_run('analytics');
+SELECT * FROM dbtindb_run('analytics');
 --  step |   model    | action |                 statement
 -- ------+------------+--------+-------------------------------------------
 --     1 | stg_orders | create | CREATE VIEW "analytics"."stg_orders" AS ...
@@ -28,11 +28,11 @@ SELECT * FROM dbinja_run('analytics');
 - **dbt's own Jinja dialect:** models are rendered with the MiniJinja fork from [dbt v2](https://github.com/dbt-labs/dbt), the Rust engine that dbt itself uses, and not a lookalike.
 - **The dbt functions that shape a DAG:** `ref`, `source`, `config`, `var`, `this`, `target` and `is_incremental`, plus project-wide macros from `macros/`.
 - **Atomic builds:** a run happens in one transaction. If any model fails, nothing changes.
-- **Safe rebuilds:** dbinja only drops relations it created, never uses `CASCADE`, and refuses to replace a table or view it did not create.
-- **Lineage in SQL:** `dbinja_models()` lists each model's dependencies, sources and build order. `dbinja_compile()` shows the SQL a model compiles to.
+- **Safe rebuilds:** dbtindb only drops relations it created, never uses `CASCADE`, and refuses to replace a table or view it did not create.
+- **Lineage in SQL:** `dbtindb_models()` lists each model's dependencies, sources and build order. `dbtindb_compile()` shows the SQL a model compiles to.
 - **Two databases, one project:** the same model files build in PostgreSQL (as an extension built with [pgrx](https://github.com/pgcentralfoundation/pgrx)) and in SQLite (as a loadable extension).
 
-dbinja is the third piece of a small family. It reads its models from the `jinja_templates` table of [pgjinja](https://github.com/thejens/pgjinja) (PostgreSQL) or [sqlite-jinja](https://github.com/thejens/sqlite-jinja) (SQLite), so the same rows can also be rendered with `jinja_render_named()`.
+dbtindb is the third piece of a small family. It reads its models from the `jinja_templates` table of [pgjinja](https://github.com/thejens/pgjinja) (PostgreSQL) or [sqlite-jinja](https://github.com/thejens/sqlite-jinja) (SQLite), so the same rows can also be rendered with `jinja_render_named()`.
 
 ## Contents
 
@@ -55,11 +55,11 @@ dbt is the standard way to manage SQL transformations, but running it means havi
 - **Locked-down environments:** where the only way in is a SQL connection.
 - **Prototyping:** you can try a dbt model in `psql` without setting up a project.
 
-dbinja is not a replacement for dbt on a warehouse. It builds views and tables, the core of most dbt projects. It does not run tests, snapshots, seeds or incremental models (see [what is supported](#what-is-supported-from-dbt)).
+dbtindb is not a replacement for dbt on a warehouse. It builds views and tables, the core of most dbt projects. It does not run tests, snapshots, seeds or incremental models (see [what is supported](#what-is-supported-from-dbt)).
 
 ## Installation
 
-dbinja is built from source with a [Rust toolchain](https://rustup.rs). The first build fetches dbt's Jinja engine from [dbt-labs/dbt](https://github.com/dbt-labs/dbt), pinned to the v2.0.5 release.
+dbtindb is built from source with a [Rust toolchain](https://rustup.rs). The first build fetches dbt's Jinja engine from [dbt-labs/dbt](https://github.com/dbt-labs/dbt), pinned to the v2.0.5 release.
 
 **PostgreSQL 14–18:** install [pgjinja](https://github.com/thejens/pgjinja#installation) first, then:
 
@@ -67,26 +67,26 @@ dbinja is built from source with a [Rust toolchain](https://rustup.rs). The firs
 cargo install cargo-pgrx --version 0.19.3 --locked
 cargo pgrx init --pg16 "$(which pg_config)"   # once; use your Postgres version
 
-git clone https://github.com/thejens/dbinja.git
-cd dbinja/crates/pg_dbinja
+git clone https://github.com/thejens/dbtindb.git
+cd dbtindb/crates/pg_dbtindb
 cargo pgrx install --release --no-default-features --features pg16
 ```
 
 ```sql
-CREATE EXTENSION pg_dbinja CASCADE;   -- CASCADE also creates pgjinja
+CREATE EXTENSION pg_dbtindb CASCADE;   -- CASCADE also creates pgjinja
 ```
 
 **SQLite 3.37.2 or newer:** this also needs libclang, which is used to generate the SQLite bindings.
 
 ```sh
-git clone https://github.com/thejens/dbinja.git
-cd dbinja
-cargo build --release -p sqlite_dbinja
-# target/release/libsqlite_dbinja.so (.dylib on macOS, sqlite_dbinja.dll on Windows)
+git clone https://github.com/thejens/dbtindb.git
+cd dbtindb
+cargo build --release -p sqlite_dbtindb
+# target/release/libsqlite_dbtindb.so (.dylib on macOS, sqlite_dbtindb.dll on Windows)
 ```
 
 ```sql
-.load ./target/release/libsqlite_dbinja
+.load ./target/release/libsqlite_dbtindb
 ```
 
 ## Writing a project
@@ -133,24 +133,24 @@ done
 
 | Function | Returns | Description |
 |---|---|---|
-| `dbinja_run(target_schema text = 'public', vars jsonb = '{}')` | `TABLE(step, model, action, statement)` | Builds every enabled model into `target_schema` and returns the statements it ran. Creates the schema if needed. |
-| `dbinja_compile(model text, target_schema text = 'public', vars jsonb = '{}')` | `text` | The SQL `model` compiles to, as `dbt compile` would show it. |
-| `dbinja_models(target_schema text = 'public', vars jsonb = '{}')` | `TABLE(build_order, model, path, materialized, relation, depends_on text[], sources text[])` | The enabled models in build order, with their lineage. |
+| `dbtindb_run(target_schema text = 'public', vars jsonb = '{}')` | `TABLE(step, model, action, statement)` | Builds every enabled model into `target_schema` and returns the statements it ran. Creates the schema if needed. |
+| `dbtindb_compile(model text, target_schema text = 'public', vars jsonb = '{}')` | `text` | The SQL `model` compiles to, as `dbt compile` would show it. |
+| `dbtindb_models(target_schema text = 'public', vars jsonb = '{}')` | `TABLE(build_order, model, path, materialized, relation, depends_on text[], sources text[])` | The enabled models in build order, with their lineage. |
 
 ```sql
 -- Build into a staging schema with different vars, check it, then go live.
-SELECT * FROM dbinja_run('analytics_staging', '{"since": "2024-01-01"}');
+SELECT * FROM dbtindb_run('analytics_staging', '{"since": "2024-01-01"}');
 
 -- Which models read from raw.orders?
-SELECT model FROM dbinja_models() WHERE '"raw"."orders"' = ANY (sources);
+SELECT model FROM dbtindb_models() WHERE '"raw"."orders"' = ANY (sources);
 
 -- Rebuild nightly with pg_cron.
-SELECT cron.schedule('dbinja', '0 3 * * *', $$SELECT dbinja_run('analytics')$$);
+SELECT cron.schedule('dbtindb', '0 3 * * *', $$SELECT dbtindb_run('analytics')$$);
 ```
 
 `ref()` renders as `"<target_schema>"."<model>"` and `source('raw', 'orders')` as `"raw"."orders"`. Model names longer than PostgreSQL's 63-byte identifier limit are rejected, because Postgres would silently truncate them.
 
-Relations built by dbinja are recorded in `dbinja_managed` (in the extension's schema), which `pg_dump` includes.
+Relations built by dbtindb are recorded in `dbtindb_managed` (in the extension's schema), which `pg_dump` includes.
 
 ## SQLite
 
@@ -158,9 +158,9 @@ SQLite functions return a single value, so list results are JSON arrays that you
 
 | Function | Returns |
 |---|---|
-| `dbinja_run([vars])` | A JSON array of `{step, model, action, statement}` |
-| `dbinja_compile(model [, vars])` | The compiled SQL |
-| `dbinja_models([vars])` | A JSON array of `{build_order, model, path, materialized, relation, depends_on, sources}` |
+| `dbtindb_run([vars])` | A JSON array of `{step, model, action, statement}` |
+| `dbtindb_compile(model [, vars])` | The compiled SQL |
+| `dbtindb_models([vars])` | A JSON array of `{build_order, model, path, materialized, relation, depends_on, sources}` |
 
 `vars` is JSON text, for example `'{"since": "2024-01-01"}'`.
 
@@ -169,13 +169,13 @@ CREATE TABLE jinja_templates (name TEXT PRIMARY KEY, source TEXT NOT NULL);
 -- ... insert models ...
 
 SELECT json_extract(value, '$.model'), json_extract(value, '$.action')
-FROM json_each(dbinja_run());
+FROM json_each(dbtindb_run());
 
 SELECT json_extract(value, '$.model') AS model, json_extract(value, '$.depends_on')
-FROM json_each(dbinja_models());
+FROM json_each(dbtindb_models());
 ```
 
-The functions are `DIRECTONLY`: they can be called from your SQL but not from views or triggers, where anyone who can change the schema could make other users run them. Built relations are recorded in `main.dbinja_managed`.
+The functions are `DIRECTONLY`: they can be called from your SQL but not from views or triggers, where anyone who can change the schema could make other users run them. Built relations are recorded in `main.dbtindb_managed`.
 
 SQLite only checks a view's columns when the view is queried, so a model built as a view that references a missing column builds fine and fails on first use. Models built as tables fail during the run.
 
@@ -208,7 +208,7 @@ On PostgreSQL, pgjinja's `jinja_templates` table checks each template with stand
 
 Rebuilds are deliberately conservative:
 
-- dbinja only drops relations listed in its `dbinja_managed` table. If a table you created stands where a model would go, the run fails instead of replacing it.
+- dbtindb only drops relations listed in its `dbtindb_managed` table. If a table you created stands where a model would go, the run fails instead of replacing it.
 - Drops never cascade. On PostgreSQL, a view of yours that depends on a model makes the rebuild fail, so it is never silently dropped. Drop it, or make it a model too.
 - Renders have an instruction budget, so a runaway macro cannot pin a database backend.
 
@@ -216,11 +216,11 @@ Rebuilds are deliberately conservative:
 
 ### Is this dbt?
 
-No. dbinja uses dbt's Jinja engine and follows dbt's conventions for models, macros, `ref` and `source`, so dbt models that stick to [the supported features](#what-is-supported-from-dbt) compile unchanged. It does not use dbt's parser, adapters, manifest or CLI, and it is not affiliated with dbt Labs.
+No. dbtindb uses dbt's Jinja engine and follows dbt's conventions for models, macros, `ref` and `source`, so dbt models that stick to [the supported features](#what-is-supported-from-dbt) compile unchanged. It does not use dbt's parser, adapters, manifest or CLI, and it is not affiliated with dbt Labs.
 
 ### Why not just run dbt?
 
-You should if you already run dbt, or if you need tests, snapshots, incremental models or a warehouse. dbinja is for cases where an external process is the problem: models that ship inside an application database or a SQLite file, rebuilds triggered from SQL or `pg_cron`, and environments where you only have a SQL connection.
+You should if you already run dbt, or if you need tests, snapshots, incremental models or a warehouse. dbtindb is for cases where an external process is the problem: models that ship inside an application database or a SQLite file, rebuilds triggered from SQL or `pg_cron`, and environments where you only have a SQL connection.
 
 ### Can I use it on Amazon RDS, Cloud SQL, Supabase or Neon?
 
@@ -228,10 +228,10 @@ Only where you can install custom extensions, which managed services generally d
 
 ### Who can run a build?
 
-On PostgreSQL, `dbinja_run` runs with the caller's privileges. It needs `CREATE` on the target schema, `SELECT` on the sources and on `jinja_templates`, and write access to the bookkeeping table:
+On PostgreSQL, `dbtindb_run` runs with the caller's privileges. It needs `CREATE` on the target schema, `SELECT` on the sources and on `jinja_templates`, and write access to the bookkeeping table:
 
 ```sql
-GRANT SELECT, INSERT, DELETE ON dbinja_managed TO builder;
+GRANT SELECT, INSERT, DELETE ON dbtindb_managed TO builder;
 ```
 
  Anyone who can write to `jinja_templates` decides what SQL the next run executes, so grant that like DDL rights.
@@ -240,17 +240,17 @@ GRANT SELECT, INSERT, DELETE ON dbinja_managed TO builder;
 
 ```sh
 # Core (compilation, ordering, planning)
-cargo test -p dbinja-core
+cargo test -p dbtindb-core
 
 # PostgreSQL extension; installs pgjinja into the pgrx-managed Postgres first
-cargo pgrx test pg16 -p pg_dbinja
+cargo pgrx test pg16 -p pg_dbtindb
 
 # SQLite extension, end to end through Python's sqlite3
-cargo build --release -p sqlite_dbinja
-python3 -m unittest discover -s crates/sqlite_dbinja/tests -v
+cargo build --release -p sqlite_dbtindb
+python3 -m unittest discover -s crates/sqlite_dbtindb/tests -v
 ```
 
-The workspace has three crates. `dbinja-core` compiles models, orders them and plans the statements, and is shared by both databases. `pg_dbinja` and `sqlite_dbinja` read the project from the database and execute the plan.
+The workspace has three crates. `dbtindb-core` compiles models, orders them and plans the statements, and is shared by both databases. `pg_dbtindb` and `sqlite_dbtindb` read the project from the database and execute the plan.
 
 ## License
 

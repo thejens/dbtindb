@@ -1,4 +1,4 @@
-//! The SQL functions: `dbinja_compile`, `dbinja_models` and `dbinja_run`.
+//! The SQL functions: `dbtindb_compile`, `dbtindb_models` and `dbtindb_run`.
 //!
 //! SQLite scalar functions return one value, so the list-shaped results are
 //! JSON arrays, ready for `json_each()`.
@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::ffi::{CStr, c_int};
 
-use dbinja_core::{
+use dbtindb_core::{
     CompiledModel, Dialect, Error, Existing, ExistingKind, Project, Statement, Target, build_order,
     compile, plan,
 };
@@ -15,15 +15,15 @@ use serde_json::{Value, json};
 
 use crate::sqlite::{self, Arg, Call, Db};
 
-/// The table dbinja reads models from: the same one sqlite-jinja's
+/// The table dbtindb reads models from: the same one sqlite-jinja's
 /// `jinja_render_named` renders from.
 const TEMPLATES_DDL: &str =
     "CREATE TABLE jinja_templates (name TEXT PRIMARY KEY, source TEXT NOT NULL)";
 
-/// Relations created by `dbinja_run()`. dbinja only ever drops relations
+/// Relations created by `dbtindb_run()`. dbtindb only ever drops relations
 /// listed here. SQLite resolves identifiers case-insensitively, so lookups
 /// do too.
-const MANAGED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.dbinja_managed (
+const MANAGED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.dbtindb_managed (
     relation_name TEXT PRIMARY KEY COLLATE NOCASE,
     path          TEXT NOT NULL,
     materialized  TEXT NOT NULL CHECK (materialized IN ('view', 'table')),
@@ -35,8 +35,8 @@ const MANAGED_DDL: &str = "CREATE TABLE IF NOT EXISTS main.dbinja_managed (
 const SCHEMA: &str = "main";
 
 thread_local! {
-    /// Set while `dbinja_run` executes model SQL on this thread. A model
-    /// that calls `dbinja_run` itself would rebuild the project from
+    /// Set while `dbtindb_run` executes model SQL on this thread. A model
+    /// that calls `dbtindb_run` itself would rebuild the project from
     /// inside its own build.
     static RUNNING: Cell<bool> = const { Cell::new(false) };
 }
@@ -54,12 +54,12 @@ pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
     // where whoever can write the schema could make other users run them.
     let flags = ffi::SQLITE_UTF8 | ffi::SQLITE_DIRECTONLY;
     let functions: [(&CStr, c_int, Impl); 6] = [
-        (c"dbinja_compile", 1, dbinja_compile),
-        (c"dbinja_compile", 2, dbinja_compile),
-        (c"dbinja_models", 0, dbinja_models),
-        (c"dbinja_models", 1, dbinja_models),
-        (c"dbinja_run", 0, dbinja_run),
-        (c"dbinja_run", 1, dbinja_run),
+        (c"dbtindb_compile", 1, dbtindb_compile),
+        (c"dbtindb_compile", 2, dbtindb_compile),
+        (c"dbtindb_models", 0, dbtindb_models),
+        (c"dbtindb_models", 1, dbtindb_models),
+        (c"dbtindb_run", 0, dbtindb_run),
+        (c"dbtindb_run", 1, dbtindb_run),
     ];
     for (name, n_arg, f) in functions {
         // SAFETY: forwarded from the caller.
@@ -69,15 +69,15 @@ pub unsafe fn register(db: *mut ffi::sqlite3) -> Result<(), String> {
                 name,
                 n_arg,
                 flags,
-                Box::new(move |call| f(call).map_err(|e| format!("dbinja: {e}"))),
+                Box::new(move |call| f(call).map_err(|e| format!("dbtindb: {e}"))),
             )?;
         }
     }
     Ok(())
 }
 
-/// `dbinja_compile(model [, vars])`: the model compiled to plain SQL.
-fn dbinja_compile(call: &Call<'_>) -> Result<String, Error> {
+/// `dbtindb_compile(model [, vars])`: the model compiled to plain SQL.
+fn dbtindb_compile(call: &Call<'_>) -> Result<String, Error> {
     let model = match call.arg(0) {
         Arg::Text(t) => utf8(t)?,
         other => {
@@ -95,9 +95,9 @@ fn dbinja_compile(call: &Call<'_>) -> Result<String, Error> {
         .ok_or_else(|| Error::new(format!("no enabled model named {model:?}")))
 }
 
-/// `dbinja_models([vars])`: the enabled models in build order, with their
+/// `dbtindb_models([vars])`: the enabled models in build order, with their
 /// lineage, as a JSON array.
-fn dbinja_models(call: &Call<'_>) -> Result<String, Error> {
+fn dbtindb_models(call: &Call<'_>) -> Result<String, Error> {
     let models = compile_project(call.db(), &vars(call.arg(0))?)?;
     let order = build_order(&models)?;
     let rows: Vec<Value> = order
@@ -119,28 +119,28 @@ fn dbinja_models(call: &Call<'_>) -> Result<String, Error> {
     Ok(Value::Array(rows).to_string())
 }
 
-/// `dbinja_run([vars])`: builds every enabled model, in dependency order,
+/// `dbtindb_run([vars])`: builds every enabled model, in dependency order,
 /// and returns the statements it ran as a JSON array.
 ///
 /// The build runs inside a savepoint: if any statement fails, everything it
 /// did is rolled back, and inside a caller's transaction it commits or rolls
 /// back with that transaction.
-fn dbinja_run(call: &Call<'_>) -> Result<String, Error> {
+fn dbtindb_run(call: &Call<'_>) -> Result<String, Error> {
     if RUNNING.get() {
         return Err(Error::new(
-            "dbinja_run() cannot be called while it is running",
+            "dbtindb_run() cannot be called while it is running",
         ));
     }
     let vars = vars(call.arg(0))?;
     let db = call.db();
     let _running = Running::enter();
-    db.exec("SAVEPOINT dbinja_run").map_err(Error::new)?;
+    db.exec("SAVEPOINT dbtindb_run").map_err(Error::new)?;
     let built = build(db, &vars);
     let end = match &built {
-        Ok(_) => db.exec("RELEASE dbinja_run"),
+        Ok(_) => db.exec("RELEASE dbtindb_run"),
         Err(_) => db
-            .exec("ROLLBACK TO dbinja_run")
-            .and_then(|()| db.exec("RELEASE dbinja_run")),
+            .exec("ROLLBACK TO dbtindb_run")
+            .and_then(|()| db.exec("RELEASE dbtindb_run")),
     };
     // The build's own error matters more than a failure to end the
     // savepoint after it.
@@ -176,11 +176,11 @@ fn build(db: Db, vars: &Value) -> Result<Vec<Value>, Error> {
         db.exec(statement.sql())
             .map_err(|e| Error::new(format!("{e}\nwhile running:\n{}", statement.sql())))?;
         // The bookkeeping row moves in the same savepoint as the DDL, so
-        // dbinja_managed always matches what actually exists.
+        // dbtindb_managed always matches what actually exists.
         let (model, action) = match statement {
             Statement::Drop { model, .. } => {
                 db.query(
-                    "DELETE FROM main.dbinja_managed WHERE relation_name = ?1",
+                    "DELETE FROM main.dbtindb_managed WHERE relation_name = ?1",
                     &[model],
                 )
                 .map_err(Error::new)?;
@@ -189,7 +189,7 @@ fn build(db: Db, vars: &Value) -> Result<Vec<Value>, Error> {
             Statement::Create { model, .. } => {
                 let compiled = find(&models, model);
                 db.query(
-                    "INSERT INTO main.dbinja_managed (relation_name, path, materialized) \
+                    "INSERT INTO main.dbtindb_managed (relation_name, path, materialized) \
                      VALUES (?1, ?2, ?3)",
                     &[model, &compiled.path, compiled.materialized.as_str()],
                 )
@@ -207,7 +207,7 @@ fn build(db: Db, vars: &Value) -> Result<Vec<Value>, Error> {
     Ok(steps)
 }
 
-/// What exists in `main` under a model's name, and whether dbinja made it.
+/// What exists in `main` under a model's name, and whether dbtindb made it.
 fn existing(db: Db, name: &str) -> Result<Option<Existing>, Error> {
     let rows = db
         .query(
@@ -229,7 +229,7 @@ fn existing(db: Db, name: &str) -> Result<Option<Existing>, Error> {
     };
     let managed = !db
         .query(
-            "SELECT 1 FROM main.dbinja_managed WHERE relation_name = ?1",
+            "SELECT 1 FROM main.dbtindb_managed WHERE relation_name = ?1",
             &[name],
         )
         .map_err(Error::new)?

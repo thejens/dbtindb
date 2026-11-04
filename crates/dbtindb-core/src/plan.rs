@@ -6,8 +6,8 @@ use crate::{CompiledModel, Error, Materialization};
 #[derive(Clone, Debug)]
 pub struct Existing {
     pub kind: ExistingKind,
-    /// Whether dbinja created it, according to the database's
-    /// `dbinja_managed` table.
+    /// Whether dbtindb created it, according to the database's
+    /// `dbtindb_managed` table.
     pub managed: bool,
 }
 
@@ -41,7 +41,7 @@ impl Statement {
 /// cascade. A relation that depends on a model but is not itself a model
 /// makes the drop fail, and with the build running in one transaction
 /// nothing changes. It is not silently dropped. Likewise a relation that
-/// stands where a model should go but that dbinja did not create is an
+/// stands where a model should go but that dbtindb did not create is an
 /// error, never dropped.
 pub fn plan(
     models: &[CompiledModel],
@@ -54,7 +54,7 @@ pub fn plan(
         let Some(found) = existing(m)? else { continue };
         if !found.managed {
             return Err(Error::new(format!(
-                "{} already exists and was not created by dbinja; drop or rename it, or rename model {:?}",
+                "{} already exists and was not created by dbtindb; drop or rename it, or rename model {:?}",
                 m.relation, m.name
             )));
         }
@@ -63,7 +63,7 @@ pub fn plan(
             ExistingKind::Table => "TABLE",
             ExistingKind::Other(what) => {
                 return Err(Error::new(format!(
-                    "{} is a {what}, which dbinja does not replace",
+                    "{} is a {what}, which dbtindb does not replace",
                     m.relation
                 )));
             }
@@ -145,7 +145,7 @@ mod tests {
             }))
         })
         .unwrap_err();
-        assert!(err.0.contains("was not created by dbinja"), "{err}");
+        assert!(err.0.contains("was not created by dbtindb"), "{err}");
 
         let err = plan(&models, &[0], |_| {
             Ok(Some(Existing {

@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// A dbinja error: a message meant for the person running the project.
+/// A dbtindb error: a message meant for the person running the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 

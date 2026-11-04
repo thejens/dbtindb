@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/dbinja-core", "crates/pg_dbinja", "crates/sqlite_dbinja"]
+members = ["crates/dbtindb-core", "crates/pg_dbtindb", "crates/sqlite_dbtindb"]
 
 [workspace.package]
 version = "0.1.0"
 license = "MIT"
-repository = "https://github.com/thejens/dbinja"
+repository = "https://github.com/thejens/dbtindb"
 
 [workspace.dependencies]
 # dbt v2's fork of MiniJinja: the Jinja dialect dbt itself renders with,

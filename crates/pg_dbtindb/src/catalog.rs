@@ -1,6 +1,6 @@
 //! Reading the project and the state of the target schema.
 
-use dbinja_core::{Error, Existing, ExistingKind, Project};
+use dbtindb_core::{Error, Existing, ExistingKind, Project};
 use pgrx::datum::DatumWithOid;
 use pgrx::spi::{SpiClient, SpiHeapTupleData};
 
@@ -52,12 +52,12 @@ pub fn load_project(client: &SpiClient<'_>) -> Result<Project, Error> {
     Ok(project)
 }
 
-/// The quoted name of this extension's `dbinja_managed` table.
+/// The quoted name of this extension's `dbtindb_managed` table.
 pub fn managed_table(client: &SpiClient<'_>) -> Result<String, Error> {
-    extension_table(client, "pg_dbinja", "dbinja_managed")
+    extension_table(client, "pg_dbtindb", "dbtindb_managed")
 }
 
-/// What exists at `schema.name`, and whether dbinja created it.
+/// What exists at `schema.name`, and whether dbtindb created it.
 pub fn existing(
     client: &SpiClient<'_>,
     managed_table: &str,

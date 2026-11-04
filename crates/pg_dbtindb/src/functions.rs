@@ -1,6 +1,6 @@
 //! The SQL-callable functions.
 
-use dbinja_core::{build_order, compile, plan, CompiledModel, Dialect, Error, Statement, Target};
+use dbtindb_core::{build_order, compile, plan, CompiledModel, Dialect, Error, Statement, Target};
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
 use pgrx::JsonB;
@@ -15,10 +15,10 @@ type RunRow = (i32, String, String, String);
 ///
 /// Runs in the caller's transaction, so a failure anywhere leaves
 /// everything as it was. Existing model relations are dropped and
-/// recreated; relations dbinja did not create are never touched, and
+/// recreated; relations dbtindb did not create are never touched, and
 /// nothing is dropped with CASCADE.
 #[pg_extern(volatile, parallel_unsafe)]
-fn dbinja_run(
+fn dbtindb_run(
     target_schema: default!(&str, "'public'"),
     vars: default!(JsonB, "'{}'::jsonb"),
 ) -> TableIterator<
@@ -31,7 +31,7 @@ fn dbinja_run(
     ),
 > {
     let rows = Spi::connect_mut(|client| run(client, target_schema, &vars.0));
-    TableIterator::new(rows.unwrap_or_else(|e| error!("dbinja: {e}")))
+    TableIterator::new(rows.unwrap_or_else(|e| error!("dbtindb: {e}")))
 }
 
 fn run(
@@ -58,7 +58,7 @@ fn run(
             .update(statement.sql(), None, &[])
             .map_err(|e| Error::new(format!("{e}\nwhile running:\n{}", statement.sql())))?;
         // The bookkeeping row moves in the same transaction as the DDL, so
-        // dbinja_managed always matches what actually exists.
+        // dbtindb_managed always matches what actually exists.
         let (model, action) = match statement {
             Statement::Drop { model, .. } => {
                 client
@@ -104,7 +104,7 @@ fn run(
 
 /// Returns `model` compiled to plain SQL, as `dbt compile` would.
 #[pg_extern(stable, parallel_safe)]
-fn dbinja_compile(
+fn dbtindb_compile(
     model: &str,
     target_schema: default!(&str, "'public'"),
     vars: default!(JsonB, "'{}'::jsonb"),
@@ -117,7 +117,7 @@ fn dbinja_compile(
             .map(|m| m.sql)
             .ok_or_else(|| Error::new(format!("no enabled model named {model:?}")))
     });
-    result.unwrap_or_else(|e| error!("dbinja: {e}"))
+    result.unwrap_or_else(|e| error!("dbtindb: {e}"))
 }
 
 /// (build_order, model, path, materialized, relation, depends_on, sources)
@@ -136,7 +136,7 @@ type ModelRow = (
 // be a type alias.
 #[allow(clippy::type_complexity)]
 #[pg_extern(stable, parallel_safe)]
-fn dbinja_models(
+fn dbtindb_models(
     target_schema: default!(&str, "'public'"),
     vars: default!(JsonB, "'{}'::jsonb"),
 ) -> TableIterator<
@@ -172,7 +172,7 @@ fn dbinja_models(
             })
             .collect())
     });
-    TableIterator::new(result.unwrap_or_else(|e| error!("dbinja: {e}")))
+    TableIterator::new(result.unwrap_or_else(|e| error!("dbtindb: {e}")))
 }
 
 fn target(schema: &str) -> Target {
