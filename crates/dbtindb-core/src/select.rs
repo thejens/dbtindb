@@ -197,10 +197,16 @@ fn node_matches(n: &Node, method: &str, value: &str) -> Result<bool, Error> {
         "package" => n.fqn.first().is_some_and(|p| glob(value, p)),
         "test_type" => match value {
             "generic" => matches!(n.kind, NodeKind::GenericTest { .. }),
-            "singular" | "data" => matches!(n.kind, NodeKind::SingularTest),
+            "singular" => matches!(n.kind, NodeKind::SingularTest),
+            // dbt 1.8's names: data tests are generic and singular ones.
+            "data" => matches!(
+                n.kind,
+                NodeKind::GenericTest { .. } | NodeKind::SingularTest
+            ),
+            "unit" => matches!(n.kind, NodeKind::UnitTest(_)),
             _ => {
                 return Err(Error::new(format!(
-                    "test_type:{value} is not generic or singular"
+                    "test_type:{value} is not generic, singular, data or unit"
                 )));
             }
         },

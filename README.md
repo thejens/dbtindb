@@ -118,16 +118,18 @@ A project is the set of rows in `dbtindb_files`, one per file, keyed by its path
 
 | Path | What it is |
 |---|---|
-| `dbt_project.yml` | Optional. `name`, `vars`, the `*-paths` settings, `packages-install-path`, `dispatch`, `on-run-start`/`on-run-end`, and `models:`/`seeds:`/`snapshots:`/`data_tests:` config trees with `+key` settings per folder. |
+| `dbt_project.yml` | Optional. `name`, `vars`, the `*-paths` settings (including `analysis-paths` and `docs-paths`), `packages-install-path`, `dispatch`, `on-run-start`/`on-run-end`, and `models:`/`seeds:`/`snapshots:`/`data_tests:` config trees with `+key` settings per folder. |
 | `models/**/<name>.sql` | A model, built as `<name>` (or its `alias`). Model names are unique across folders, as in dbt. |
-| `models/**/*.yml` | Properties: sources, descriptions, columns, tests and `config:` for models, seeds and snapshots. |
+| `models/**/*.yml` | Properties: sources, descriptions, columns, tests and `config:` for models, seeds, snapshots and analyses, YAML snapshots, and `unit_tests:`. |
 | `seeds/**/<name>.csv` | A seed, loaded into a table with inferred column types (integer, numeric, boolean, date, timestamp, text) or `column_types`. |
-| `snapshots/**/*.sql` | `{% snapshot %}` blocks. |
+| `snapshots/**/*.sql` | `{% snapshot %}` blocks. Snapshots can also be declared in YAML with `relation:`. |
+| `analyses/**/<name>.sql` | An analysis: compiled with `dbtindb_compile`, never run. |
+| `**/*.md` | `{% docs %}` blocks, which descriptions use through `{{ doc('name') }}`. They are read from every resource path, or from `docs-paths`. |
 | `tests/**/*.sql` | Singular tests. `tests/generic/*.sql` holds `{% test %}` blocks. |
 | `macros/**/*.sql` | Macros and `{% test %}` blocks. Every file can call them without an import. |
 | `dbt_packages/<package>/**` | An installed package, as `dbt deps` leaves it. See [Packages](#packages). |
 
-Other files, such as docs `.md` files, are ignored. A model is one `SELECT` (a trailing `;` is allowed):
+Other files are ignored. A model is one `SELECT` (a trailing `;` is allowed):
 
 ```sql
 -- models/marts/customer_orders.sql
@@ -150,7 +152,7 @@ dbtindb load ./jaffle_shop --dialect postgres | psql -v ON_ERROR_STOP=1 "$DATABA
 dbtindb load ./jaffle_shop --dialect sqlite | sqlite3 app.db
 ```
 
-It takes `dbt_project.yml` and the `.sql`, `.yml`, `.yaml` and `.csv` files under the project's model, seed, snapshot, test and macro paths (as `dbt_project.yml` sets them), and the same for every package in `dbt_packages/`, skipping hidden files, `target/` and anything else. Run `dbt deps` first if the project has packages. The script runs in one transaction. By default it replaces the table's contents, so files deleted on disk disappear from the database; `--merge` only inserts and updates. `--table` loads into a schema-qualified table when the extension's schema is not on the `search_path`. The PostgreSQL script uses dollar quoting, so backslashes, quotes and `:psql_variables` in your files arrive unchanged.
+It takes `dbt_project.yml` and the `.sql`, `.yml`, `.yaml`, `.csv` and `.md` files under the project's model, seed, snapshot, test, analysis, macro and docs paths (as `dbt_project.yml` sets them), and the same for every package in `dbt_packages/`, skipping hidden files, `target/` and anything else. Run `dbt deps` first if the project has packages. The script runs in one transaction. By default it replaces the table's contents, so files deleted on disk disappear from the database; `--merge` only inserts and updates. `--table` loads into a schema-qualified table when the extension's schema is not on the `search_path`. The PostgreSQL script uses dollar quoting, so backslashes, quotes and `:psql_variables` in your files arrive unchanged.
 
 You can also write the rows yourself: a path is a file's path relative to the project root. The PostgreSQL extension creates `dbtindb_files`; on SQLite, `dbtindb load` creates it, or you run `CREATE TABLE dbtindb_files (path TEXT PRIMARY KEY, source TEXT NOT NULL)`.
 
@@ -179,17 +181,17 @@ dbt_utils 1.3 works on PostgreSQL. On SQLite, its date, string and test macros w
 
 | Command | dbt equivalent | What it does |
 |---|---|---|
-| `dbtindb_build` | `dbt build` | Seeds, models, snapshots and tests in DAG order. Each node runs after the tests of the nodes it reads, and an error-severity test failure aborts the build. |
+| `dbtindb_build` | `dbt build` | Seeds, models, snapshots, tests and unit tests in DAG order. Each node runs after the tests of the nodes it reads, and an error-severity test failure or a failing unit test aborts the build. |
 | `dbtindb_run` | `dbt run` | Models |
 | `dbtindb_seed` | `dbt seed` | Seeds |
 | `dbtindb_snapshot` | `dbt snapshot` | Snapshots |
-| `dbtindb_test` | `dbt test` | Tests. Failures are reported as rows with status `fail`, and nothing is raised. |
+| `dbtindb_test` | `dbt test` | Tests and unit tests. Failures are reported as rows with status `fail`, and nothing is raised. |
 | `dbtindb_ls` | `dbt ls` | The selected nodes in build order, with lineage and relations |
-| `dbtindb_compile` | `dbt compile` | A model's, snapshot's or test's compiled SQL |
+| `dbtindb_compile` | `dbt compile` | A model's, snapshot's, test's or analysis's compiled SQL. For a unit test, the model's SQL reading its fixtures. |
 
 Every command takes a selector (`--select`), an exclusion (`--exclude`), `vars` and `full_refresh`. Each step reports `step, unique_id, name, resource_type, action, status, failures, sql`. Here `action` is what was done (`create table`, `incremental (merge)`, `reload seed`, `update snapshot`, `refresh materialized view`, `test`, ...), and `sql` is every statement that ran for the node, hooks included.
 
-Selection follows dbt: space-separated items are a union and commas intersect. Graph operators are `+`, `n+`, `+n` and `@`. The selector methods are `fqn` (the default), `path`/`file`, `tag`, `resource_type`, `package`, `test_type`, `test_name`, `config.<key>` and `source`. Tests whose parents are all selected are included, as with dbt's default eager indirect selection.
+Selection follows dbt: space-separated items are a union and commas intersect. Graph operators are `+`, `n+`, `+n` and `@`. The selector methods are `fqn` (the default), `path`/`file`, `tag`, `resource_type`, `package`, `test_type` (`generic`, `singular`, `data` or `unit`), `test_name`, `config.<key>` and `source`. Tests whose parents are all selected are included, as with dbt's default eager indirect selection.
 
 ## Ad-hoc dbt SQL
 
@@ -275,19 +277,23 @@ SQLite only checks a view's columns when the view is queried, so a view model th
 |---|---|
 | **Materializations** | `view`, `table`, `ephemeral` (inlined as CTEs), `incremental`, `materialized_view` (PostgreSQL), seeds and snapshots. Custom `{% materialization %}` blocks are not supported. |
 | **Incremental models** | `is_incremental()`, `{{ this }}`, `unique_key` (one or more columns), `incremental_strategy` `append`, `delete+insert` and `merge` (PostgreSQL 15+), `on_schema_change` `ignore`, `fail`, `append_new_columns` and `sync_all_columns`, and `full_refresh` (per call or per model). |
-| **Snapshots** | `strategy='timestamp'` (`updated_at`) and `strategy='check'` (`check_cols`, or `'all'`), `unique_key`, `invalidate_hard_deletes` and `hard_deletes: invalidate`, with dbt's `dbt_scd_id`, `dbt_updated_at`, `dbt_valid_from` and `dbt_valid_to` columns. Snapshots go to `target_schema`, or the schema their config gives. |
+| **Snapshots** | `{% snapshot %}` blocks and dbt 1.9's YAML snapshots (`relation: ref(...)` or `source(...)`). `strategy='timestamp'` (`updated_at`) and `strategy='check'` (`check_cols`, or `'all'`), `unique_key`, and `hard_deletes` `ignore`, `invalidate` (or `invalidate_hard_deletes`) and `new_record`, which adds a version with `dbt_is_deleted = 'True'`. dbt's `dbt_scd_id`, `dbt_updated_at`, `dbt_valid_from` and `dbt_valid_to` columns. Snapshots go to `target_schema`, or the schema their config gives. |
 | **Seeds** | Type inference, `column_types`, `delimiter`. A reload keeps the table when its columns are unchanged. |
-| **Tests** | `unique`, `not_null`, `accepted_values` (`quote`), `relationships`, custom generic tests (`{% test %}`, with or without `arguments:`), package tests (`dbt_utils.expression_is_true`), singular tests, and `severity`, `warn_if`, `error_if`, `fail_calc`, `limit`, `where` and `enabled` configs. Tests on sources work too. |
-| **Config** | `config()` in files, `config:` in property files, and `+key` in `dbt_project.yml`, merged as dbt does (tags union, hooks append). Keys: `materialized`, `schema`, `alias`, `enabled`, `tags`, `meta`, `pre_hook`, `post_hook`, `persist_docs`, `full_refresh`, plus the incremental, snapshot, seed and test keys above. |
+| **Tests** | `unique`, `not_null`, `accepted_values` (`quote`), `relationships`, custom generic tests (`{% test %}`, with or without `arguments:`), package tests (`dbt_utils.expression_is_true`), singular tests, and `severity`, `warn_if`, `error_if`, `fail_calc`, `limit`, `where` and `enabled` configs. Tests on sources work too. `store_failures` (or `store_failures_as: table` or `view`) keeps the failing rows in `<target schema>_dbt_test__audit.<test name>` (on SQLite, in `main`). The rows of a failing `dbtindb_test` stay; a failing build rolls them back with everything else. |
+| **Unit tests** | dbt 1.8 `unit_tests:` with `given` inputs (`ref`, `source`, and `this` for incremental models) in the `dict`, `csv` and `sql` formats, `expect`, and `overrides` of `vars`, `env_vars` and the `is_incremental` macro. Fixture rows are cast to the column types of the inputs, so those must exist in the database (`dbtindb_build` builds them first), unless the rows are given as `sql`. Rows are compared as multisets over the columns `expect` names, and the differing rows are logged. |
+| **Docs** | `{% docs %}` blocks and `doc()` in descriptions, and `persist_docs` as comments on PostgreSQL. |
+| **Analyses** | Compiled with `ref`, `source` and macros, never run. |
+| **Grants** | `grants` on PostgreSQL: after a build, the privileges others hold on the relation are made equal to the config, merged as dbt does (`+select` adds grantees). SQLite has no roles and ignores them. |
+| **Config** | `config()` in files, `config:` in property files, and `+key` in `dbt_project.yml`, merged as dbt does (tags union, hooks append). Keys: `materialized`, `schema`, `alias`, `enabled`, `tags`, `meta`, `pre_hook`, `post_hook`, `persist_docs`, `grants`, `full_refresh`, plus the incremental, snapshot, seed and test keys above. |
 | **Hooks** | `pre_hook` and `post_hook` per node, `on-run-start` and `on-run-end` per project. Hooks can use `run_query`, `this` and `target`. |
-| **Jinja context** | `ref` (one argument, or two naming this project), `source`, `config`, `var`, `env_var`, `this`, `target`, `execute`, `model`, `project_name`, `is_incremental`, `run_query` (agate-like rows and columns), `statement` blocks with `load_result`/`store_result`, `load_relation`, `log`, `print`, `exceptions` (`raise_compiler_error`, `warn`), `adapter` (`dispatch`, `quote`, `execute`, `get_relation`, `load_relation`, `get_columns_in_relation`, `type`), `api.Column` and `api.Relation`, `modules` (`datetime`, `re`, `pytz`), `flags`, `run_started_at`, `invocation_id`, `dbt_version`, `fromjson`, `tojson`, `fromyaml`, `toyaml`, `zip`, `set`, `try_or_compiler_error` and `local_md5`, and Python's string, list and dict methods. Relations and columns are dbt-like objects (`relation.identifier`, `column.quoted`, `column.is_string()`). |
+| **Jinja context** | `ref` (one argument, or two naming this project), `source`, `doc`, `config`, `var`, `env_var`, `this`, `target`, `execute`, `model`, `project_name`, `is_incremental`, `run_query` (agate-like rows and columns), `statement` blocks with `load_result`/`store_result`, `load_relation`, `log`, `print`, `exceptions` (`raise_compiler_error`, `warn`), `adapter` (`dispatch`, `quote`, `execute`, `get_relation`, `load_relation`, `get_columns_in_relation`, `type`), `api.Column` and `api.Relation`, `modules` (`datetime`, `re`, `pytz`), `flags`, `run_started_at`, `invocation_id`, `dbt_version`, `fromjson`, `tojson`, `fromyaml`, `toyaml`, `zip`, `set`, `try_or_compiler_error` and `local_md5`, and Python's string, list and dict methods. Relations and columns are dbt-like objects (`relation.identifier`, `column.quoted`, `column.is_string()`). |
 | **Macros** | Global, as in dbt, and they can override `generate_schema_name` and `generate_alias_name`. Packages and dbt's cross-database macros as described in [Packages](#packages), with dbt's `adapter.dispatch` search order and `dispatch:` config. |
-| **Not supported** | Package models, seeds and snapshots, cross-project or versioned `ref`, `database` configs, Python models, unit tests, exposures, metrics, semantic models, `{% docs %}` blocks, `store_failures`, `dbt source freshness` and `dbt docs`. Each is an error or ignored, never a silently different build. |
+| **Not supported** | Package models, seeds and snapshots, cross-project or versioned `ref`, `database` configs, Python models, unit test fixture files and overrides of macros other than `is_incremental`, exposures, metrics, semantic models, `dbt source freshness` and `dbt docs`. Each is an error or ignored, never a silently different build. |
 
 ## How a command runs
 
 1. **Parse:** every file is read from `dbtindb_files`, and every model, snapshot and test is rendered with `execute = false`, as dbt's parser does. This collects `ref`s, `source`s and `config`. Disabled nodes are dropped, relations are named with `generate_schema_name`/`generate_alias_name`, and duplicate relations are reported.
-2. **Plan:** the selected nodes are ordered topologically. A cycle is reported with its path, for example `dependency cycle: a -> c -> b -> a`. Each node is planned as a replace, an update (incremental, snapshot, seed reload or materialized-view refresh) or a query (tests).
+2. **Plan:** the selected nodes are ordered topologically. A cycle is reported with its path, for example `dependency cycle: a -> c -> b -> a`. Each node is planned as a replace, an update (incremental, snapshot, seed reload or materialized-view refresh) or a query (tests, and unit tests, which compile their model on fixture rows).
 3. **Execute:** schemas are created, then `on-run-start` runs. Replaced relations are dropped dependents-first, and nodes are built in order with their hooks. Models are rendered again here with `execute = true`, so `run_query` and `is_incremental()` see the database. Last comes `on-run-end`.
 4. All of this runs in one transaction: the caller's on PostgreSQL, and a savepoint on SQLite. Any error rolls back the whole command.
 

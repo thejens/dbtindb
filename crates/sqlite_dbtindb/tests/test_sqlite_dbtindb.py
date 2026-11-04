@@ -489,7 +489,7 @@ unit_tests:
         with self.assertRaisesRegex(sqlite3.OperationalError, "has no relation in the database"):
             call(conn, "dbtindb_test", json.dumps({"select": "totals"}))
         call(conn, "dbtindb_run")
-        r = call(conn, "dbtindb_test", json.dumps({"select": "resource_type:unit_test"}))
+        r = call(conn, "dbtindb_test", json.dumps({"select": "test_type:unit"}))
         statuses = {s["name"]: (s["status"], s["failures"]) for s in r["steps"]}
         self.assertEqual(statuses, {
             "sums_per_customer": ("pass", 0),
