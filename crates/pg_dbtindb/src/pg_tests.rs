@@ -230,6 +230,61 @@ mod tests {
     }
 
     #[pg_test]
+    fn grants_follow_the_config_and_docs_become_comments() {
+        Spi::run(
+            "CREATE ROLE dbtindb_reader; CREATE ROLE dbtindb_writer; CREATE ROLE dbtindb_old;
+             CREATE TABLE src (id int); INSERT INTO src VALUES (1)",
+        )
+        .unwrap();
+        file(
+            "dbt_project.yml",
+            "name: shop\nmodels:\n  +grants: {select: [dbtindb_reader]}\n",
+        );
+        file(
+            "models/inc.sql",
+            "{{ config(materialized='incremental', grants={'+select': ['dbtindb_writer'], 'insert': ['dbtindb_writer']}) }}\n\
+             select * from src",
+        );
+        file(
+            "models/docs.md",
+            "{% docs inc %}\nOne row per *id*.\n{% enddocs %}",
+        );
+        file(
+            "models/schema.yml",
+            "models:\n  - name: inc\n    description: \"{{ doc('inc') }}\"\n    \
+             config: {persist_docs: {relation: true}}\n",
+        );
+        let grants = || {
+            text(
+                "SELECT string_agg(grantee || ':' || privilege_type, ',' ORDER BY grantee, privilege_type)
+                 FROM information_schema.role_table_grants
+                 WHERE table_name = 'inc' AND grantee LIKE 'dbtindb_%'",
+            )
+        };
+        Spi::run("SELECT * FROM dbtindb_run()").unwrap();
+        assert_eq!(
+            grants(),
+            "dbtindb_reader:SELECT,dbtindb_writer:INSERT,dbtindb_writer:SELECT"
+        );
+        assert_eq!(
+            text("SELECT obj_description('public.inc'::regclass)"),
+            "One row per *id*."
+        );
+        // The incremental table is kept, so grants made outside the config
+        // are revoked and the ones the config dropped go away.
+        Spi::run("GRANT UPDATE ON public.inc TO dbtindb_old").unwrap();
+        file(
+            "models/inc.sql",
+            "{{ config(materialized='incremental', grants={'insert': []}) }}\nselect * from src",
+        );
+        assert_eq!(
+            text("SELECT action FROM dbtindb_run()"),
+            "incremental (append)"
+        );
+        assert_eq!(grants(), "dbtindb_reader:SELECT");
+    }
+
+    #[pg_test]
     fn refreshes_materialized_views_until_their_query_changes() {
         Spi::run("CREATE TABLE src (id int); INSERT INTO src VALUES (1)").unwrap();
         file(
@@ -434,7 +489,7 @@ mod tests {
 
         let err = error_of("SELECT dbtindb_compile('missing')");
         assert!(
-            err.contains("no enabled model, snapshot or test named \"missing\""),
+            err.contains("no enabled model, snapshot, test or analysis named \"missing\""),
             "{err}"
         );
     }

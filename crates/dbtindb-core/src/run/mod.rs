@@ -7,6 +7,7 @@
 //! managed view that depends on a replaced relation is rebuilt along with
 //! it, and anything else that depends on it makes the run fail.
 
+mod grants;
 mod managed;
 mod materialize;
 mod snapshot;
@@ -339,6 +340,7 @@ impl Runner<'_> {
         }
         if let Some(rel) = &node.relation {
             sql.extend(materialize::persist_docs(self, node, rel)?);
+            sql.extend(grants::apply(self, node, rel)?);
         }
         self.steps.push(Step {
             step: self.steps.len() + 1,
