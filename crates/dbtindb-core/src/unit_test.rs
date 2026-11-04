@@ -37,7 +37,7 @@ impl Session {
         let mut this = None;
         let mut defs = Vec::new();
         for given in &def.given {
-            let input = parse_input(&given.input).map_err(&err)?;
+            let input = parse_input(&given.input).map_err(err)?;
             let (cte_name, real) = match &input {
                 Input::Ref(name) => {
                     let target = self.shared.names.read().unwrap().get(name).cloned();
@@ -75,7 +75,7 @@ impl Session {
                     given.input
                 )));
             }
-            let sql = fixture_sql(d, &given.rows, &columns, &given.input).map_err(&err)?;
+            let sql = fixture_sql(d, &given.rows, &columns, &given.input).map_err(err)?;
             let cte = Relation::cte(d, &format!("fixture_{cte_name}"));
             defs.push((cte.rendered.clone(), sql));
             match input {
