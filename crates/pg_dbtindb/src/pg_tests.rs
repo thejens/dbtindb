@@ -350,6 +350,30 @@ mod tests {
     }
 
     #[pg_test]
+    fn renders_and_views_inline_sql() {
+        shop();
+        Spi::run("SELECT * FROM dbtindb_build(target_schema => 'analytics')").unwrap();
+        let sql = text(
+            "SELECT dbtindb_sql($$select count(*) as n from {{ ref('customers') }} where total_cents > {{ var('min', 0) }}$$, \
+             '{\"min\": 1000}', 'analytics')",
+        );
+        assert_eq!(
+            sql,
+            r#"select count(*) as n from "analytics_marts"."customers" where total_cents > 1000"#
+        );
+        let sql = text(
+            "SELECT dbtindb_view('big', $$select customer_id from {{ ref('customers') }} where total_cents > 1000$$, \
+             target_schema => 'analytics')",
+        );
+        assert!(sql.contains(r#""analytics_marts"."customers""#), "{sql}");
+        assert_eq!(count("SELECT customer_id::bigint FROM big"), 1);
+        // Replacing it may change its columns.
+        Spi::run("SELECT dbtindb_view('big', 'select 1 as a, 2 as b')").unwrap();
+        assert_eq!(count("SELECT b::bigint FROM big"), 2);
+        assert_eq!(count("SELECT count(*) FROM pg_views WHERE viewname = 'big' AND schemaname LIKE 'pg_temp%'"), 1);
+    }
+
+    #[pg_test]
     fn cannot_run_from_inside_a_build() {
         file(
             "models/m.sql",

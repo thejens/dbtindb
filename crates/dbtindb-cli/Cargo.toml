@@ -1,0 +1,17 @@
+[package]
+name = "dbtindb-cli"
+description = "The dbtindb command line: turns a dbt project directory into SQL that loads it into PostgreSQL or SQLite."
+edition = "2024"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dbtindb"
+path = "src/main.rs"
+
+[dependencies]
+# For dbt_project.yml's *-paths, so the CLI picks exactly the files the
+# extensions read.
+dbtindb-core = { path = "../dbtindb-core" }
+clap = { version = "4.6.7", features = ["derive"] }

@@ -21,6 +21,29 @@ impl Session {
         Ok(inject_ctes(&sql, &defs))
     }
 
+    /// Ad-hoc SQL rendered in the project's context, as `dbt compile
+    /// --inline` does: `ref` and `source` resolve to the project's
+    /// relations, ephemeral models become CTEs, and `execute` is true, so
+    /// `run_query` works. There is no `this`, since it is no node.
+    pub fn compile_inline(&self, sql: &str) -> Result<String, Error> {
+        self.shared.begin(
+            true,
+            "inline SQL",
+            None,
+            Default::default(),
+            Default::default(),
+        );
+        let rendered = self.render_str("<inline>", sql);
+        let cur = self.shared.finish();
+        let rendered = rendered.map_err(|e| Error::new(format!("compiling inline SQL: {e}")))?;
+        let mut seen = BTreeSet::new();
+        let mut defs = Vec::new();
+        for cte in cur.ctes {
+            self.collect_cte(&cte, &mut seen, &mut defs)?;
+        }
+        Ok(inject_ctes(&trim_statement(&rendered), &defs))
+    }
+
     /// Renders a hook (or any SQL template) with `node` as the context.
     pub fn render_hook(&self, unique_id: Option<&str>, hook: &str) -> Result<String, Error> {
         match unique_id {
@@ -193,6 +216,37 @@ pub fn trim_statement(sql: &str) -> String {
 mod tests {
     use crate::Dialect;
     use crate::parse_tests::load;
+
+    #[test]
+    fn compiles_inline_sql_against_the_project() {
+        let s = load(
+            &[
+                (
+                    "models/base.sql",
+                    "{{ config(materialized='ephemeral') }} select 1 as id",
+                ),
+                (
+                    "models/orders.sql",
+                    "{{ config(schema='marts') }} select 1 as id",
+                ),
+                (
+                    "macros/m.sql",
+                    "{% macro double(x) %}{{ x }} * 2{% endmacro %}",
+                ),
+            ],
+            Dialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(
+            s.compile_inline("select {{ double('o.id') }} from {{ ref('orders') }} o join {{ ref('base') }} b using (id);\n")
+                .unwrap(),
+            "with \"__dbt__cte__base\" as (\nselect 1 as id\n)\nselect o.id * 2 from \"analytics_marts\".\"orders\" o join \"__dbt__cte__base\" b using (id)"
+        );
+        let err = s
+            .compile_inline("select * from {{ ref('nope') }}")
+            .unwrap_err();
+        assert!(err.0.contains("nope"), "{err}");
+    }
 
     #[test]
     fn inlines_ephemeral_models_as_ctes() {

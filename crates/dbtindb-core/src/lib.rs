@@ -18,13 +18,13 @@ mod session;
 mod testgen;
 mod yaml;
 
-pub use api::{Invocation, Listed, compile, invoke, load, ls, steps_json};
+pub use api::{Invocation, Listed, compile, compile_inline, invoke, load, ls, steps_json};
 pub use config::Config;
 pub use context::Relation;
 pub use database::{Column, Database, RelationKind, Table};
 pub use dialect::{Dialect, SeedType};
 pub use error::Error;
 pub use node::{Manifest, Materialized, Node, NodeKind, ResourceType, TestTarget};
-pub use project::Project;
+pub use project::{PROJECT_FILE, Project, Settings};
 pub use run::{Command, Options, Step};
 pub use session::{Session, Target};
