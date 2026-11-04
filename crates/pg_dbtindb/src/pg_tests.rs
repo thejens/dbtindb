@@ -214,6 +214,11 @@ mod tests {
         let action = text("SELECT action FROM dbtindb_run()");
         assert_eq!(action, "create table");
         Spi::run("ALTER TABLE src ADD COLUMN w int; UPDATE src SET v = 'B', w = 7 WHERE id = 2; INSERT INTO src VALUES (3, 'c', 8)").unwrap();
+        if count("SELECT current_setting('server_version_num')::bigint") < 150000 {
+            let err = error_of("SELECT * FROM dbtindb_run()");
+            assert!(err.contains("MERGE needs PostgreSQL 15 or newer"), "{err}");
+            return;
+        }
         let action = text("SELECT action FROM dbtindb_run()");
         assert_eq!(action, "incremental (merge)");
         assert_eq!(

@@ -215,7 +215,7 @@ SQLite only checks a view's columns when the view is queried, so a view model th
 | | |
 |---|---|
 | **Materializations** | `view`, `table`, `ephemeral` (inlined as CTEs), `incremental`, `materialized_view` (PostgreSQL), seeds and snapshots. Custom `{% materialization %}` blocks are not supported. |
-| **Incremental models** | `is_incremental()`, `{{ this }}`, `unique_key` (one or more columns), `incremental_strategy` `append`, `delete+insert` and `merge` (PostgreSQL), `on_schema_change` `ignore`, `fail`, `append_new_columns` and `sync_all_columns`, and `full_refresh` (per call or per model). |
+| **Incremental models** | `is_incremental()`, `{{ this }}`, `unique_key` (one or more columns), `incremental_strategy` `append`, `delete+insert` and `merge` (PostgreSQL 15+), `on_schema_change` `ignore`, `fail`, `append_new_columns` and `sync_all_columns`, and `full_refresh` (per call or per model). |
 | **Snapshots** | `strategy='timestamp'` (`updated_at`) and `strategy='check'` (`check_cols`, or `'all'`), `unique_key`, `invalidate_hard_deletes` and `hard_deletes: invalidate`, with dbt's `dbt_scd_id`, `dbt_updated_at`, `dbt_valid_from` and `dbt_valid_to` columns. Snapshots go to `target_schema`, or the schema their config gives. |
 | **Seeds** | Type inference, `column_types`, `delimiter`. A reload keeps the table when its columns are unchanged. |
 | **Tests** | `unique`, `not_null`, `accepted_values` (`quote`), `relationships`, custom generic tests (`{% test %}`, with or without `arguments:`), singular tests, and `severity`, `warn_if`, `error_if`, `where` and `enabled` configs. Tests on sources work too. |

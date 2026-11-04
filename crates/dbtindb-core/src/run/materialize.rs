@@ -135,6 +135,21 @@ fn incremental_update(
                     node.path
                 )));
             }
+            // MERGE arrived in PostgreSQL 15.
+            let version =
+                r.db.query("SELECT current_setting('server_version_num')::int")?;
+            if version
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.as_i64())
+                .is_some_and(|v| v < 150000)
+            {
+                return Err(Error::new(format!(
+                    "{}: MERGE needs PostgreSQL 15 or newer; use delete+insert",
+                    node.path
+                )));
+            }
             if keys.is_empty() {
                 return Err(Error::new(format!(
                     "{}: merge needs a unique_key",
