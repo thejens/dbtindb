@@ -32,6 +32,7 @@ const KNOWN_KEYS: &[&str] = &[
     "warn_if",
     "error_if",
     "limit",
+    "fail_calc",
     "strategy",
     "updated_at",
     "check_cols",

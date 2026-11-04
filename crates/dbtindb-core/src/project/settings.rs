@@ -1,5 +1,7 @@
 //! `dbt_project.yml`: the project's name, paths, vars, config and hooks.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
 use crate::{Error, yaml};
@@ -16,6 +18,11 @@ pub struct Settings {
     pub snapshot_paths: Vec<String>,
     pub test_paths: Vec<String>,
     pub macro_paths: Vec<String>,
+    /// Where `dbt deps` installs packages: `dbt_packages` by default.
+    pub packages_install_path: String,
+    /// `dispatch:` search orders, by macro namespace: which packages
+    /// `adapter.dispatch(name, namespace)` searches, in order.
+    pub dispatch: BTreeMap<String, Vec<String>>,
     /// `vars:`, both global ones and those scoped to this project's name.
     pub vars: Map<String, Value>,
     /// The `models:`, `seeds:`, `snapshots:` and `data_tests:` config trees.
@@ -36,6 +43,8 @@ impl Default for Settings {
             snapshot_paths: vec!["snapshots".into()],
             test_paths: vec!["tests".into()],
             macro_paths: vec!["macros".into()],
+            packages_install_path: "dbt_packages".into(),
+            dispatch: BTreeMap::new(),
             vars: Map::new(),
             models: Value::Null,
             seeds: Value::Null,
@@ -106,15 +115,34 @@ impl Settings {
                     hooks(v).ok_or_else(|| field_error(key, "a string or a list of strings"))?;
             }
         }
-        if let Some(packages) = doc.get("packages")
-            && !packages.is_null()
-        {
-            return Err(Error::new(
-                "dbt_project.yml: packages are not supported; copy the macros you need into macros/",
-            ));
+        if let Some(v) = doc.get("packages-install-path") {
+            s.packages_install_path = v
+                .as_str()
+                .ok_or_else(|| field_error("packages-install-path", "a path"))?
+                .trim_end_matches('/')
+                .to_owned();
+        }
+        if let Some(v) = doc.get("dispatch") {
+            s.dispatch = dispatch(v).ok_or_else(|| {
+                field_error(
+                    "dispatch",
+                    "a list of {macro_namespace: <package>, search_order: [<package>, ...]}",
+                )
+            })?;
         }
         Ok(s)
     }
+}
+
+/// The `dispatch:` list, keyed by macro namespace.
+fn dispatch(v: &Value) -> Option<BTreeMap<String, Vec<String>>> {
+    let mut orders = BTreeMap::new();
+    for entry in v.as_array()? {
+        let namespace = entry.get("macro_namespace")?.as_str()?;
+        let order = string_list(entry.get("search_order")?)?;
+        orders.insert(namespace.to_owned(), order);
+    }
+    Some(orders)
 }
 
 /// A hook setting: one SQL string or a list of them.
@@ -160,5 +188,18 @@ mod tests {
         assert_eq!(s.seed_paths, ["seeds"]);
         assert_eq!(Value::Object(s.vars), serde_json::json!({"a": 1, "b": 2}));
         assert_eq!(s.on_run_end.len(), 1);
+        assert_eq!(s.packages_install_path, "dbt_packages");
+    }
+
+    #[test]
+    fn reads_dispatch_and_install_path() {
+        let s = Settings::parse(
+            "name: shop\npackages-install-path: deps/\ndispatch:\n  - macro_namespace: dbt_utils\n    search_order: [shop, dbt_utils]\n",
+        )
+        .unwrap();
+        assert_eq!(s.packages_install_path, "deps");
+        assert_eq!(s.dispatch["dbt_utils"], ["shop", "dbt_utils"]);
+        let err = Settings::parse("dispatch: [{macro_namespace: x}]\n").unwrap_err();
+        assert!(err.0.contains("dispatch must be"), "{err}");
     }
 }

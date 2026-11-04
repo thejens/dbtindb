@@ -8,7 +8,10 @@ repository.workspace = true
 
 [dependencies]
 minijinja.workspace = true
+minijinja-contrib.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
 csv.workspace = true
 md-5.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true

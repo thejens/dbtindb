@@ -6,9 +6,14 @@
 //! [`Shared::current`], which the parser and the runner set before each
 //! render.
 
+mod api;
 mod builtins;
+mod dbt_macros;
+mod functions;
 mod objects;
+mod packages;
 mod relation;
+mod statements;
 mod table;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +26,7 @@ use minijinja::{Environment, Error, ErrorKind, State, Value};
 use serde_json::{Map, Value as Json};
 
 pub use objects::to_jinja;
+pub use packages::resolve as resolve_macro;
 pub use relation::Relation;
 
 use self::objects::{
@@ -61,6 +67,25 @@ pub struct Current {
     /// While executing: the refs found while parsing. A ref outside them
     /// would be built out of order.
     pub parsed_refs: Option<BTreeSet<String>>,
+    /// What `store_result()` kept, for `load_result()`.
+    pub results: BTreeMap<String, Value>,
+}
+
+/// The command-line flags of the invocation, as `flags` shows them.
+#[derive(Clone, Copy, Debug)]
+pub struct InvocationFlags {
+    /// The command: `run`, `build`, `compile`, ...
+    pub which: &'static str,
+    pub full_refresh: bool,
+}
+
+impl Default for InvocationFlags {
+    fn default() -> Self {
+        InvocationFlags {
+            which: "compile",
+            full_refresh: false,
+        }
+    }
 }
 
 pub struct Shared {
@@ -72,6 +97,11 @@ pub struct Shared {
     pub db: Option<Arc<dyn Database>>,
     pub names: RwLock<BTreeMap<String, RefTarget>>,
     pub sources: BTreeMap<(String, String), SourceTable>,
+    /// `dispatch:` search orders, by macro namespace.
+    pub dispatch: BTreeMap<String, Vec<String>>,
+    /// The installed packages' names.
+    pub packages: BTreeSet<String>,
+    pub flags: Mutex<InvocationFlags>,
     pub current: Mutex<Current>,
 }
 
@@ -139,43 +169,56 @@ pub fn environment(
     env.set_loader(move |name| Ok(files.get(name).cloned()));
 
     // The fork resolves an unknown name `m` as the template `<pkg>.m`:
-    // first in this project, then in the built-in "dbt" package.
+    // first in the current package, then in this project, then in dbt's.
     let pkg = shared.project_name.clone();
     env.add_global(constants::ROOT_PACKAGE_NAME, Value::from(pkg.as_str()));
     env.add_global(constants::TARGET_PACKAGE_NAME, Value::from(pkg.as_str()));
     env.add_global(constants::DIALECT, Value::from(shared.dialect.name()));
 
-    let mut builtin_names = ValueMap::new();
-    for name in macro_names(&mut env, builtins::BUILTINS_PATH, builtins::BUILTINS)? {
-        env.add_template_owned(
-            format!("dbt.{name}"),
-            builtins::BUILTINS.to_owned(),
-            Some(builtins::BUILTINS_PATH.into()),
+    let mut registry = packages::Registry::default();
+    registry.add_file(
+        &mut env,
+        packages::DBT,
+        builtins::BUILTINS_PATH,
+        builtins::BUILTINS,
+        false,
+    )?;
+    for (path, source) in dbt_macros::files(shared.dialect) {
+        registry.add_file(
+            &mut env,
+            packages::DBT,
+            &format!("<dbt>/{path}"),
+            source,
+            false,
         )?;
-        builtin_names.insert(Value::from(name.as_str()), Value::from("dbt"));
+    }
+    for path in &project.macro_files {
+        registry.add_file(&mut env, &pkg, path, &project.files[path], false)?;
+    }
+    for package in project.packages.values() {
+        for path in &package.macro_files {
+            registry.add_file(&mut env, &package.name, path, &project.files[path], true)?;
+        }
+    }
+
+    let mut dbt_names = ValueMap::new();
+    for name in registry.macros.get(packages::DBT).into_iter().flatten() {
+        dbt_names.insert(Value::from(name.as_str()), Value::from(packages::DBT));
     }
     let mut namespaces = ValueMap::new();
     namespaces.insert(
         Value::from(shared.dialect.name()),
-        Value::from_object(builtin_names),
+        Value::from_object(dbt_names),
     );
     env.add_global(
         constants::DBT_AND_ADAPTERS_NAMESPACE,
         Value::from_object(namespaces),
     );
 
-    let mut owners: BTreeMap<String, String> = BTreeMap::new();
-    for path in &project.macro_files {
-        let source = &project.files[path];
-        for name in macro_names(&mut env, path, source)? {
-            if let Some(other) = owners.insert(name.clone(), path.clone()) {
-                return Err(crate::Error::new(format!(
-                    "macro {name:?} is defined in both {other} and {path}"
-                )));
-            }
-            env.add_template_owned(format!("{pkg}.{name}"), source.clone(), Some(path.clone()))?;
-        }
-    }
+    // `modules` (datetime, re, pytz), `dict`, `cycler` and `joiner`, and
+    // the Python methods dbt's Jinja has: `d.get(k, default)`, `s.split()`.
+    minijinja_contrib::add_to_environment(&mut env);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
 
     env.add_global(
         "target",
@@ -195,8 +238,18 @@ pub fn environment(
     env.add_global("this", Value::from_object(This(shared.clone())));
     env.add_global("execute", Value::from_object(Execute(shared.clone())));
     env.add_global("model", Value::from_object(ModelObject(shared.clone())));
+    env.add_global("api", Value::from_object(api::Api(shared.clone())));
+    env.add_global(
+        "flags",
+        Value::from_object(functions::Flags(shared.clone())),
+    );
+    // The dbt release whose behaviour dbtindb follows. Macros test it: dbt's
+    // own `equals` takes a dbt 2-only path for versions starting with `2.`.
+    env.add_global("dbt_version", Value::from("1.10.0"));
+    env.add_global("run_started_at", functions::run_started_at());
+    env.add_global("invocation_id", functions::invocation_id());
 
-    let functions: [(&'static str, Impl); 10] = [
+    let functions: [(&'static str, Impl); 12] = [
         ("ref", ref_fn),
         ("source", source_fn),
         ("var", var_fn),
@@ -205,6 +258,8 @@ pub fn environment(
             Ok(Value::from(s.current.lock().unwrap().is_incremental))
         }),
         ("run_query", run_query_fn),
+        ("load_result", statements::load_result),
+        ("load_relation", statements::load_relation),
         ("log", log_fn),
         ("fromjson", |_, _, a| {
             let text = a.string(0, "string")?;
@@ -228,7 +283,7 @@ pub fn environment(
             ))
         }),
     ];
-    for (name, f) in functions {
+    for (name, f) in functions.into_iter().chain(functions::FUNCTIONS) {
         env.add_global(
             name,
             Value::from_object(NativeFn {
@@ -238,6 +293,8 @@ pub fn environment(
             }),
         );
     }
+    // Last, so a package named like a context variable is an error.
+    registry.add_namespaces(&mut env)?;
     Ok(env)
 }
 

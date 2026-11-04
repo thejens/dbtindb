@@ -14,8 +14,14 @@ repository = "https://github.com/thejens/dbtindb"
 # pinned to the commit of the v2.0.5 release tag (the same pin dbt-temporal
 # uses). Its default features are required: dbt only builds it that way.
 minijinja = { git = "https://github.com/dbt-labs/dbt", rev = "a3bdd96bf62f02c8babb060a79f32de6998c235a", package = "minijinja", features = ["loader", "custom_syntax", "preserve_order", "fuel"] }
+# The fork's contrib crate: dbt's `modules` (datetime, re, pytz), `dict`, and
+# Python's methods on strings, lists and dicts (`d.get(k, default)`).
+minijinja-contrib = { git = "https://github.com/dbt-labs/dbt", rev = "a3bdd96bf62f02c8babb060a79f32de6998c235a", package = "minijinja-contrib", features = ["datetime", "pycompat"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-serde-saphyr = { version = "2.1.0", default-features = false, features = ["deserialize"] }
+serde-saphyr = { version = "2.1.0", default-features = false, features = ["deserialize", "serialize"] }
+# For `run_started_at`, a datetime of minijinja-contrib's type.
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
 csv = "1.4.0"
 md-5 = "0.11.0"
 

@@ -33,6 +33,17 @@ pub enum Command {
 }
 
 impl Command {
+    /// The dbt command's name, as `flags.WHICH` reports it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Command::Run => "run",
+            Command::Seed => "seed",
+            Command::Snapshot => "snapshot",
+            Command::Test => "test",
+            Command::Build => "build",
+        }
+    }
+
     fn runs(self, rt: ResourceType) -> bool {
         match self {
             Command::Run => rt == ResourceType::Model,
@@ -86,6 +97,7 @@ pub fn execute(session: &Session, command: Command, options: &Options) -> Result
         .db
         .clone()
         .ok_or_else(|| Error::new("running needs a database connection"))?;
+    session.set_flags(command.name(), options.full_refresh);
     let mut runner = Runner {
         s: session,
         db: db.clone(),

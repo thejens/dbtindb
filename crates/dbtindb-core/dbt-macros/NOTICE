@@ -1,0 +1,15 @@
+dbt's macros
+============
+
+The files under dbt-adapters/ and dbt-postgres/ are dbt's own macros,
+copied unchanged from the dbt repository (https://github.com/dbt-labs/dbt,
+crates/dbt-loader/src/dbt_macro_assets/, commit
+a3bdd96bf62f02c8babb060a79f32de6998c235a, the dbt v2.0.5 release). They
+are maintained upstream in dbt-labs/dbt-adapters
+(https://github.com/dbt-labs/dbt-adapters).
+
+Copyright dbt Labs, Inc. Licensed under the Apache License, Version 2.0;
+see LICENSE-APACHE in this directory.
+
+The files under sqlite/ and dbtindb/ are dbtindb's own, under dbtindb's
+license.

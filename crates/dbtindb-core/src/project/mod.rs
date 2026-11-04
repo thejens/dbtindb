@@ -5,13 +5,15 @@
 //! `models/**/*.yml`, `seeds/**/*.csv`, `snapshots/**/*.sql`,
 //! `tests/**/*.sql`, `macros/**/*.sql`. Paths can be changed in
 //! `dbt_project.yml` as in dbt. Any other file can still be included or
-//! imported by name.
+//! imported by name. Installed packages live under `dbt_packages/`.
 
+mod packages;
 mod properties;
 mod settings;
 
 use std::collections::BTreeMap;
 
+pub use packages::Package;
 pub use properties::{ColumnProps, Properties, ResourceProps, SourceTable, TestDef};
 pub use settings::{PROJECT_FILE, Settings};
 
@@ -44,16 +46,20 @@ pub struct Project {
     /// Files whose macros (and `{% test %}` blocks) are global, sorted.
     pub macro_files: Vec<String>,
     pub properties: Properties,
+    /// Installed packages, by name.
+    pub packages: BTreeMap<String, Package>,
 }
 
 impl Project {
     /// Builds a project from `(path, contents)` pairs.
     pub fn new(files: impl IntoIterator<Item = (String, String)>) -> Result<Self, Error> {
         let files: BTreeMap<String, String> = files.into_iter().collect();
-        let settings = match files.get(PROJECT_FILE) {
+        let mut settings = match files.get(PROJECT_FILE) {
             Some(text) => Settings::parse(text)?,
             None => Settings::default(),
         };
+        let (packages, package_paths) = packages::packages(&settings, &files)?;
+        scope_vars(&mut settings, &packages);
         let mut p = Project {
             settings,
             files: BTreeMap::new(),
@@ -63,9 +69,12 @@ impl Project {
             snapshot_files: Vec::new(),
             macro_files: Vec::new(),
             properties: Properties::default(),
+            packages,
         };
         for (path, text) in &files {
-            p.classify(path, text)?;
+            if !package_paths.contains(path) {
+                p.classify(path, text)?;
+            }
         }
         p.files = files;
         Ok(p)
@@ -113,6 +122,23 @@ impl Project {
             return insert(&mut self.seeds, "seed", file);
         }
         Ok(())
+    }
+}
+
+/// dbtindb has one var namespace, so vars scoped to a package
+/// (`vars: {dbt_utils: {...}}`) are global, and a package's own vars are
+/// defaults the project can override.
+fn scope_vars(settings: &mut Settings, packages: &BTreeMap<String, Package>) {
+    for (name, package) in packages {
+        if let Some(serde_json::Value::Object(scoped)) = settings.vars.get(name).cloned() {
+            settings.vars.remove(name);
+            settings.vars.extend(scoped);
+        }
+        for (k, v) in &package.vars {
+            if !settings.vars.contains_key(k) {
+                settings.vars.insert(k.clone(), v.clone());
+            }
+        }
     }
 }
 

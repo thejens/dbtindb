@@ -279,6 +279,48 @@ mod tests {
     }
 
     #[pg_test]
+    fn packages_statements_and_cross_database_macros() {
+        file("dbt_packages/tools/dbt_project.yml", "name: tools\n");
+        file(
+            "dbt_packages/tools/macros/tools.sql",
+            "{% macro answer() %}{% call statement('a', fetch_result=True) %}select 41 + 1 as n{% endcall %}\
+             {{ return(load_result('a').data[0][0]) }}{% endmacro %}\n\
+             {% macro column_list(sql) %}{{ return(get_columns_in_query(sql) | join(',')) }}{% endmacro %}\n\
+             {% test sums_to(model, column_name, total) %}{{ config(fail_calc='sum(diff)') }}\
+             select abs(sum({{ column_name }}) - {{ total }}) as diff from {{ model }}{% endtest %}",
+        );
+        file(
+            "models/m.sql",
+            "select {{ tools.answer() if execute else 0 }} as answer,\n\
+             '{{ tools.column_list('select 1 as a, 2 as b') if execute }}' as cols,\n\
+             ({{ dbt.dateadd('month', 1, \"'2024-01-31'::date\") }})::date as next_month,\n\
+             {{ dbt.datediff(\"'2024-01-31'::date\", \"'2024-03-01'::date\", 'month') }} as months,\n\
+             {{ dbt.split_part(\"'a-b-c'\", \"'-'\", 2) }} as part,\n\
+             {{ dbt.hash(\"'x'\") }} as h",
+        );
+        file(
+            "models/m.yml",
+            "models:\n  - name: m\n    columns:\n      - name: answer\n        data_tests: [{tools.sums_to: {total: 42}}]\n",
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM dbtindb_build() WHERE status IN ('success', 'pass')"),
+            2
+        );
+        assert_eq!(
+            text("SELECT concat_ws('|', answer, cols, next_month, months, part, h) FROM public.m"),
+            "42|a,b|2024-02-29|2|b|9dd4e461268c8034f5c8564e155c67a6"
+        );
+        file(
+            "models/m.yml",
+            "models:\n  - name: m\n    columns:\n      - name: answer\n        data_tests: [{tools.sums_to: {total: 40}}]\n",
+        );
+        assert_eq!(
+            count("SELECT failures FROM dbtindb_test() WHERE name = 'tools_sums_to_m_answer'"),
+            2
+        );
+    }
+
+    #[pg_test]
     fn failing_tests() {
         shop();
         Spi::run("INSERT INTO raw_orders VALUES (4, 3, 'DK', 1, '2024-01-01')").unwrap();

@@ -1,6 +1,6 @@
 //! A minimal, safe wrapper over the parts of the SQLite C API this extension
-//! uses: registering scalar functions, reading their text arguments,
-//! returning text, and running statements on the calling connection.
+//! uses: registering scalar functions, reading their arguments, returning
+//! text or NULL, and running statements on the calling connection.
 //!
 //! Everything goes through the routine table SQLite hands a loadable
 //! extension, via `libsqlite3-sys`. Only APIs from SQLite 3.30 or earlier
@@ -51,6 +51,33 @@ impl<'a> Call<'a> {
                 ffi::SQLITE_FLOAT => Arg::Other("real"),
                 _ => Arg::Other("blob"),
             }
+        }
+    }
+
+    /// Argument `i` as SQL would cast it to text, or `None` for NULL.
+    pub fn text(&self, i: usize) -> Option<&'a [u8]> {
+        let &v = self.args.get(i)?;
+        // SAFETY: as in `arg`; sqlite3_value_text converts numbers to text
+        // in place, and the pointer is read before the length.
+        unsafe {
+            if ffi::sqlite3_value_type(v) == ffi::SQLITE_NULL {
+                return None;
+            }
+            let p = ffi::sqlite3_value_text(v);
+            let n = ffi::sqlite3_value_bytes(v);
+            Some(slice(p.cast(), n))
+        }
+    }
+
+    /// Argument `i` as SQL would cast it to an integer, or `None` for NULL.
+    pub fn int(&self, i: usize) -> Option<i64> {
+        let &v = self.args.get(i)?;
+        // SAFETY: `v` is a live argument of the current call.
+        unsafe {
+            if ffi::sqlite3_value_type(v) == ffi::SQLITE_NULL {
+                return None;
+            }
+            Some(ffi::sqlite3_value_int64(v))
         }
     }
 
@@ -202,9 +229,9 @@ impl Drop for Stmt {
     }
 }
 
-/// A scalar function's implementation. `Ok` becomes a text result, `Err` a
-/// SQL error with that message.
-pub type ScalarFn = Box<dyn Fn(&Call<'_>) -> Result<String, String>>;
+/// A scalar function's implementation. `Ok(Some)` becomes a text result,
+/// `Ok(None)` NULL, and `Err` a SQL error with that message.
+pub type ScalarFn = Box<dyn Fn(&Call<'_>) -> Result<Option<String>, String>>;
 
 /// Registers a scalar function on `db`. The closure is freed by SQLite when
 /// the function is replaced or the connection closes.
@@ -265,7 +292,8 @@ unsafe extern "C" fn trampoline(
     // SAFETY: valid context; results are copied by SQLite (TRANSIENT).
     unsafe {
         match result {
-            Ok(s) => ffi::sqlite3_result_text64(
+            Ok(None) => ffi::sqlite3_result_null(ctx),
+            Ok(Some(s)) => ffi::sqlite3_result_text64(
                 ctx,
                 s.as_ptr().cast(),
                 s.len() as ffi::sqlite3_uint64,
