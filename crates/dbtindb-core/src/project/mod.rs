@@ -7,9 +7,11 @@
 //! `dbt_project.yml` as in dbt. Any other file can still be included or
 //! imported by name. Installed packages live under `dbt_packages/`.
 
+mod docs;
 mod packages;
 mod properties;
 mod settings;
+pub mod unit_tests;
 
 use std::collections::BTreeMap;
 
@@ -40,12 +42,16 @@ pub struct Project {
     pub models: BTreeMap<String, NodeFile>,
     pub seeds: BTreeMap<String, NodeFile>,
     pub singular_tests: BTreeMap<String, NodeFile>,
+    /// Analyses: SQL that is compiled but never run.
+    pub analyses: BTreeMap<String, NodeFile>,
     /// Files that hold `{% snapshot %}` blocks. Snapshot names come from
     /// the blocks, so they are only known once the files are rendered.
     pub snapshot_files: Vec<NodeFile>,
     /// Files whose macros (and `{% test %}` blocks) are global, sorted.
     pub macro_files: Vec<String>,
     pub properties: Properties,
+    /// The text of each `{% docs %}` block, by name.
+    pub docs: BTreeMap<String, String>,
     /// Installed packages, by name.
     pub packages: BTreeMap<String, Package>,
 }
@@ -66,9 +72,11 @@ impl Project {
             models: BTreeMap::new(),
             seeds: BTreeMap::new(),
             singular_tests: BTreeMap::new(),
+            analyses: BTreeMap::new(),
             snapshot_files: Vec::new(),
             macro_files: Vec::new(),
             properties: Properties::default(),
+            docs: BTreeMap::new(),
             packages,
         };
         for (path, text) in &files {
@@ -90,6 +98,7 @@ impl Project {
             &s.snapshot_paths,
             &s.test_paths,
             &s.macro_paths,
+            &s.analysis_paths,
         ];
         if yaml && roots.iter().any(|r| under(r, path).is_some()) {
             return self.properties.add_file(path, text);
@@ -111,10 +120,16 @@ impl Project {
                 }
                 return insert(&mut self.singular_tests, "test", file);
             }
+            if let Some(file) = under(&s.analysis_paths, path) {
+                return insert(&mut self.analyses, "analysis", file);
+            }
             if under(&s.macro_paths, path).is_some() {
                 self.macro_files.push(path.to_owned());
                 return Ok(());
             }
+        }
+        if ext == "md" && under(&self.settings.docs_roots(), path).is_some() {
+            return docs::add_file(&mut self.docs, path, text);
         }
         if ext == "csv"
             && let Some(file) = under(&s.seed_paths, path)
@@ -143,6 +158,32 @@ fn scope_vars(settings: &mut Settings, packages: &BTreeMap<String, Package>) {
 }
 
 /// The node file at `path`, if it lies under one of `roots`.
+impl Project {
+    /// The node a property file declares by name, such as a YAML snapshot,
+    /// placed in the folder tree of the property file.
+    pub fn declared_in(&self, path: &str, name: &str) -> NodeFile {
+        let s = &self.settings;
+        let roots: Vec<String> = [
+            &s.model_paths,
+            &s.seed_paths,
+            &s.snapshot_paths,
+            &s.test_paths,
+            &s.analysis_paths,
+            &s.macro_paths,
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+        let dirs = under(&roots, path).map(|f| f.dirs).unwrap_or_default();
+        NodeFile {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            dirs,
+        }
+    }
+}
+
 fn under(roots: &[String], path: &str) -> Option<NodeFile> {
     roots.iter().find_map(|root| {
         let rest = path.strip_prefix(root.as_str())?.strip_prefix('/')?;

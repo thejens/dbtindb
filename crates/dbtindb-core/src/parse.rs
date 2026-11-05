@@ -8,7 +8,8 @@ use minijinja::Value;
 use crate::config::Config;
 use crate::context::{Current, RefTarget, Relation};
 use crate::node::{Manifest, Materialized, Node, NodeKind, ResourceType};
-use crate::project::{NodeFile, ResourceProps};
+use crate::project::unit_tests::UnitTestDef;
+use crate::project::{ColumnProps, NodeFile, ResourceProps};
 use crate::session::Session;
 use crate::{Error, testgen};
 
@@ -33,6 +34,51 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
             }
         }
     }
+    // dbt 1.9's YAML snapshots name a `relation:` instead of a SELECT.
+    let yaml_snapshots: Vec<(String, String, NodeFile)> = session
+        .project
+        .properties
+        .snapshots
+        .iter()
+        .filter_map(|(name, props)| {
+            let relation = props.relation.clone()?;
+            Some((
+                name.clone(),
+                relation,
+                session.project.declared_in(&props.file, name),
+            ))
+        })
+        .collect();
+    for (name, relation, file) in yaml_snapshots {
+        if let Some((_, sql)) = snapshots.iter().find(|(n, _)| *n == name) {
+            return Err(Error::new(format!(
+                "{}: snapshot {name:?} is defined both here and in {}",
+                file.path, sql.path
+            )));
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(Error::new(format!(
+                "{}: snapshot name {name:?} must be letters, digits and underscores",
+                file.path
+            )));
+        }
+        let relation = relation.trim();
+        let is_call = (relation.starts_with("ref(") || relation.starts_with("source("))
+            && relation.ends_with(')');
+        if !is_call {
+            return Err(Error::new(format!(
+                "{}: snapshot {name:?}: relation must be a ref() or source() call, not {relation:?}",
+                file.path
+            )));
+        }
+        session.env.add_template_owned(
+            format!("{project_name}.snapshot_{name}"),
+            format!("{{% snapshot {name} %}}select * from {{{{ {relation} }}}}{{% endsnapshot %}}"),
+            Some(file.path.clone()),
+        )?;
+        snapshots.push((name, file));
+    }
+
     let p = &session.project;
     let mut declared: Vec<(ResourceType, String, NodeFile)> = Vec::new();
     declared.extend(
@@ -53,6 +99,9 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
     {
         let mut names = session.shared.names.write().unwrap();
         for (rt, name, file) in &declared {
+            if *rt == ResourceType::Analysis {
+                continue;
+            }
             let unique_id = format!("{}.{project_name}.{name}", rt.as_str());
             let target = RefTarget {
                 unique_id,
@@ -71,10 +120,17 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
         }
     }
 
+    // Analyses can ref models but are not ref()able themselves.
+    declared.extend(
+        p.analyses
+            .values()
+            .map(|f| (ResourceType::Analysis, f.name.clone(), f.clone())),
+    );
     for (rt, name, file) in &declared {
         let props = match rt {
             ResourceType::Model => p.properties.models.get(name),
             ResourceType::Seed => p.properties.seeds.get(name),
+            ResourceType::Analysis => p.properties.analyses.get(name),
             _ => p.properties.snapshots.get(name),
         }
         .cloned()
@@ -115,6 +171,13 @@ pub fn parse(session: &mut Session) -> Result<Manifest, Error> {
             unreachable!("test names are made unique");
         }
     }
+    for def in &session.project.properties.unit_tests {
+        if let Some(node) = unit_test_node(session, &nodes, def)? {
+            nodes.insert(node.unique_id.clone(), node);
+        }
+    }
+    // Tests that store their failures are named only now.
+    resolve_relations(session, &mut nodes)?;
     Ok(Manifest {
         nodes,
         on_run_start: session.project.settings.on_run_start.clone(),
@@ -134,12 +197,12 @@ fn parse_node(
     let mut fqn = vec![project_name.clone()];
     fqn.extend(file.dirs.iter().cloned());
     fqn.push(name.to_owned());
-    let tree = match rt {
-        ResourceType::Model => &settings.models,
-        ResourceType::Seed => &settings.seeds,
-        _ => &settings.snapshots,
+    let mut config = match rt {
+        ResourceType::Model => Config::from_project(&settings.models, &fqn),
+        ResourceType::Seed => Config::from_project(&settings.seeds, &fqn),
+        ResourceType::Snapshot => Config::from_project(&settings.snapshots, &fqn),
+        _ => Config::default(),
     };
-    let mut config = Config::from_project(tree, &fqn);
     config.merge(&props.config);
     let unique_id = format!("{}.{project_name}.{name}", rt.as_str());
     let mut node = Node {
@@ -153,15 +216,24 @@ fn parse_node(
         relation: None,
         depends_on: BTreeSet::new(),
         sources: BTreeSet::new(),
-        description: props.description.clone(),
-        columns: props.columns.clone(),
+        description: render_description(session, &file.path, &props.description)?,
+        columns: props
+            .columns
+            .iter()
+            .map(|c| {
+                Ok(ColumnProps {
+                    description: render_description(session, &file.path, &c.description)?,
+                    ..c.clone()
+                })
+            })
+            .collect::<Result<_, Error>>()?,
     };
     if rt == ResourceType::Seed {
         return Ok(node);
     }
 
     let rendered = render_for_parse(session, &node, |s| match rt {
-        ResourceType::Model => s.render_file(&node.path).map(|_| ()),
+        ResourceType::Model | ResourceType::Analysis => s.render_file(&node.path).map(|_| ()),
         _ => s.call_macro(&format!("snapshot_{name}"), &[]).map(|_| ()),
     });
     let cur = rendered.map_err(|e| Error::new(format!("parsing {}: {e}", node.path)))?;
@@ -179,6 +251,7 @@ fn parse_node(
                 ))
             })?)
         }
+        ResourceType::Analysis => NodeKind::Analysis,
         _ => NodeKind::Snapshot,
     };
     if node.config.get("database").is_some() {
@@ -188,6 +261,68 @@ fn parse_node(
         )));
     }
     Ok(node)
+}
+
+/// The node of a unit test, or `None` when it or its model is disabled.
+fn unit_test_node(
+    session: &Session,
+    nodes: &BTreeMap<String, Node>,
+    def: &UnitTestDef,
+) -> Result<Option<Node>, Error> {
+    let project = &session.shared.project_name;
+    let model = format!("model.{project}.{}", def.model);
+    if !nodes.contains_key(&model) {
+        let disabled = session
+            .shared
+            .names
+            .read()
+            .unwrap()
+            .get(&def.model)
+            .is_some_and(|t| t.unique_id == model && !t.enabled);
+        if disabled {
+            return Ok(None);
+        }
+        return Err(Error::new(format!(
+            "{}: unit test {:?} tests {:?}, which is not a model",
+            def.file, def.name, def.model
+        )));
+    }
+    let mut config = Config::default();
+    config.merge(&def.config);
+    if !config.enabled()? {
+        return Ok(None);
+    }
+    let file = session.project.declared_in(&def.file, &def.name);
+    let mut fqn = vec![project.clone()];
+    fqn.extend(file.dirs);
+    fqn.extend([def.model.clone(), def.name.clone()]);
+    Ok(Some(Node {
+        unique_id: format!("unit_test.{project}.{}.{}", def.model, def.name),
+        resource_type: ResourceType::UnitTest,
+        name: def.name.clone(),
+        path: def.file.clone(),
+        fqn,
+        config,
+        kind: NodeKind::UnitTest(Box::new(def.clone())),
+        relation: None,
+        // Like a data test of the model: selected with it, and run before
+        // anything downstream of it.
+        depends_on: BTreeSet::from([model]),
+        sources: BTreeSet::new(),
+        description: render_description(session, &def.file, &def.description)?,
+        columns: Vec::new(),
+    }))
+}
+
+/// A description as dbt shows it: rendered, so `{{ doc('orders') }}`
+/// becomes the docs block's text.
+fn render_description(session: &Session, path: &str, text: &str) -> Result<String, Error> {
+    if !text.contains("{{") && !text.contains("{%") {
+        return Ok(text.to_owned());
+    }
+    session
+        .render_str("<description>", text)
+        .map_err(|e| Error::new(format!("{path}: rendering a description: {e}")))
 }
 
 /// Renders with `execute` false and returns what the render recorded.
@@ -218,6 +353,20 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
     let shared = session.shared.clone();
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     for node in nodes.values_mut() {
+        if let Some(rel) = &node.relation {
+            if node.materialized() != Some(Materialized::Ephemeral) {
+                seen.insert(
+                    (rel.schema.clone(), rel.identifier.clone()),
+                    node.unique_id.clone(),
+                );
+            }
+            continue;
+        }
+        if node.resource_type == ResourceType::Analysis
+            || (node.is_test() && node.stored_failures()?.is_none())
+        {
+            continue;
+        }
         if node.materialized() == Some(Materialized::Ephemeral) {
             node.relation = Some(Relation::cte(shared.dialect, &node.name));
             let mut names = shared.names.write().unwrap();
@@ -227,11 +376,15 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
             continue;
         }
         let node_value = Value::from_serialize(node.to_json(&shared.project_name));
-        let custom_schema = node
-            .config
-            .str("schema")?
-            .map(Value::from)
-            .unwrap_or(Value::from(()));
+        let custom_schema = match node.config.str("schema")? {
+            Some(s) => Value::from(s),
+            // dbt keeps failing rows in `<target schema>_dbt_test__audit`;
+            // SQLite has only the one schema.
+            None if node.is_test() && shared.dialect.has_schemas() => {
+                Value::from("dbt_test__audit")
+            }
+            None => Value::from(()),
+        };
         let custom_alias = node
             .config
             .str("alias")?
@@ -245,10 +398,17 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
                 .trim()
                 .to_owned(),
         };
-        let alias = session
+        let mut alias = session
             .call_macro("generate_alias_name", &[custom_alias, node_value])?
             .trim()
             .to_owned();
+        // Generic test names grow with their arguments; dbt shortens long
+        // ones the same way.
+        if node.is_test() && alias.len() >= 64 {
+            let hash = crate::run::checksum(&alias);
+            let head: String = alias.chars().take(30).collect();
+            alias = format!("{head}_{hash}");
+        }
         if !shared.dialect.has_schemas() && schema != shared.target_schema {
             return Err(Error::new(format!(
                 "{}: SQLite has no schemas, so {} cannot be built in schema {schema:?}; remove its schema config",
@@ -275,9 +435,11 @@ fn resolve_relations(session: &Session, nodes: &mut BTreeMap<String, Node>) -> R
             )));
         }
         let relation = shared.relation(&schema, &alias);
-        let mut names = shared.names.write().unwrap();
-        if let Some(t) = names.get_mut(&node.name) {
-            t.relation = relation.clone();
+        if !node.is_test() {
+            let mut names = shared.names.write().unwrap();
+            if let Some(t) = names.get_mut(&node.name) {
+                t.relation = relation.clone();
+            }
         }
         node.relation = Some(relation);
     }
@@ -296,6 +458,7 @@ fn check_unknown_properties(
         (ResourceType::Model, &p.models),
         (ResourceType::Seed, &p.seeds),
         (ResourceType::Snapshot, &p.snapshots),
+        (ResourceType::Analysis, &p.analyses),
     ] {
         for (name, props) in entries {
             let id = format!("{}.{}.{name}", rt.as_str(), session.shared.project_name);

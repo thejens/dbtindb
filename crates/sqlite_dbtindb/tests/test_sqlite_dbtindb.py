@@ -347,6 +347,31 @@ class SnapshotTest(unittest.TestCase):
             [("ada", 0), ("grace", 1)],
         )
 
+    def test_yaml_snapshot_recording_deletes(self):
+        conn = connect()
+        conn.executescript("CREATE TABLE people (id INTEGER, name TEXT); INSERT INTO people VALUES (1, 'ada'), (2, 'bob');")
+        put(conn, {
+            "models/people_src.sql": "select * from people",
+            "snapshots/people.yml": "snapshots:\n  - name: people_snap\n    relation: ref('people_src')\n    config:\n"
+                                    "      unique_key: id\n      strategy: check\n      check_cols: all\n      hard_deletes: new_record\n",
+        })
+        call(conn, "dbtindb_build")
+        conn.execute("DELETE FROM people WHERE id = 2")
+        call(conn, "dbtindb_snapshot")
+        conn.execute("INSERT INTO people VALUES (2, 'bob')")
+        call(conn, "dbtindb_snapshot")
+        call(conn, "dbtindb_snapshot")
+        rows = conn.execute(
+            "SELECT id, dbt_is_deleted, dbt_valid_to IS NULL FROM people_snap ORDER BY id, dbt_valid_from, dbt_is_deleted"
+        ).fetchall()
+        self.assertEqual(rows, [(1, "False", 1), (2, "False", 0), (2, "True", 0), (2, "False", 1)])
+        # The deletion closes the old version exactly when it starts.
+        (gap,) = conn.execute(
+            "SELECT count(*) FROM people_snap a JOIN people_snap b ON b.id = a.id "
+            "WHERE a.dbt_is_deleted = 'False' AND b.dbt_is_deleted = 'True' AND a.dbt_valid_to = b.dbt_valid_from"
+        ).fetchone()
+        self.assertEqual(gap, 1)
+
 
 class ContextTest(unittest.TestCase):
     def test_hooks_run_query_and_log(self):
@@ -387,6 +412,96 @@ from src
         statuses = {s["name"]: (s["status"], s["failures"]) for s in call(conn, "dbtindb_test")["steps"]}
         self.assertEqual(statuses, {"is_even_m_n": ("warn", 1), "no_threes": ("fail", 1)})
 
+    def test_store_failures_docs_and_analyses(self):
+        conn = connect()
+        put(conn, {
+            "dbt_project.yml": "name: shop\nmodels:\n  +materialized: table\n",
+            "models/m.sql": "select 2 as n union all select 3",
+            "models/m.yml": "models:\n  - name: m\n    description: \"{{ doc('m') }}\"\n    columns:\n      - name: n\n"
+                            "        tests:\n          - accepted_values:\n              values: [2]\n              quote: false\n"
+                            "              config: {store_failures: true}\n",
+            "models/docs.md": "{% docs m %}Numbers.{% enddocs %}",
+            "analyses/odd.sql": "select n from {{ ref('m') }} where n % 2 = 1",
+        })
+        call(conn, "dbtindb_run")
+        self.assertEqual(steps(call(conn, "dbtindb_test")), [("accepted_values_m_n", "test", "fail")])
+        self.assertEqual(conn.execute("SELECT * FROM accepted_values_m_n").fetchall(), [(3, 1)])
+        (compiled,) = conn.execute("SELECT dbtindb_compile('odd')").fetchone()
+        self.assertEqual(compiled, 'select n from "m" where n % 2 = 1')
+        # Analyses are compiled, never built.
+        self.assertEqual(objects(conn), [("table", "accepted_values_m_n"), ("table", "m")])
+
+
+class UnitTestTest(unittest.TestCase):
+    UNIT_TESTS = """
+unit_tests:
+  - name: sums_per_customer
+    model: totals
+    given:
+      - input: ref('stg')
+        rows:
+          - {id: 1, customer_id: 1, amount: 10}
+          - {id: 2, customer_id: 1, amount: 5}
+          - {id: 3, customer_id: 2}
+    expect:
+      rows:
+        - {customer_id: 1, total: 15}
+        - {customer_id: 2, total: null}
+  - name: wrong_sum
+    model: totals
+    given:
+      - input: ref('stg')
+        format: csv
+        rows: |
+          id,customer_id,amount
+          1,1,10
+    expect:
+      rows: [{customer_id: 1, total: 11}]
+  - name: only_new_rows
+    model: inc
+    overrides:
+      macros: {is_incremental: true}
+    given:
+      - input: ref('stg')
+        rows: [{id: 1}, {id: 2}, {id: 3}]
+      - input: this
+        format: sql
+        rows: select 2 as id
+    expect:
+      rows: [{id: 3}]
+"""
+
+    def project(self, conn):
+        conn.executescript("CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount INTEGER);")
+        put(conn, {
+            "models/stg.sql": "select * from orders",
+            "models/totals.sql": "{{ config(materialized='table') }}\n"
+                                 "select customer_id, sum(amount) as total from {{ ref('stg') }} group by 1",
+            "models/inc.sql": "{{ config(materialized='incremental') }}\nselect id from {{ ref('stg') }}\n"
+                              "{% if is_incremental() %}where id > (select max(id) from {{ this }}){% endif %}",
+            "models/unit_tests.yml": self.UNIT_TESTS,
+        })
+
+    def test_unit_tests_compare_the_model_on_fixture_rows(self):
+        conn = connect()
+        self.project(conn)
+        # Fixture rows are typed by the inputs' columns, so those must exist.
+        with self.assertRaisesRegex(sqlite3.OperationalError, "has no relation in the database"):
+            call(conn, "dbtindb_test", json.dumps({"select": "totals"}))
+        call(conn, "dbtindb_run")
+        r = call(conn, "dbtindb_test", json.dumps({"select": "test_type:unit"}))
+        statuses = {s["name"]: (s["status"], s["failures"]) for s in r["steps"]}
+        self.assertEqual(statuses, {
+            "sums_per_customer": ("pass", 0),
+            "wrong_sum": ("fail", 2),
+            "only_new_rows": ("pass", 0),
+        })
+        (compiled,) = conn.execute("SELECT dbtindb_compile('only_new_rows')").fetchone()
+        self.assertIn('"__dbt__cte__fixture_this"', compiled)
+        # A failing unit test fails the build, before anything downstream.
+        with self.assertRaisesRegex(sqlite3.OperationalError, "test wrong_sum failed"):
+            call(conn, "dbtindb_build")
+
 
 class SafetyTest(unittest.TestCase):
     def test_never_replaces_relations_it_did_not_create(self):
@@ -420,7 +535,7 @@ class SafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(sqlite3.OperationalError, "no dbtindb_files table"):
             conn.execute("SELECT dbtindb_ls()").fetchone()
         conn = shop()
-        with self.assertRaisesRegex(sqlite3.OperationalError, 'no enabled model, snapshot or test named "nope"'):
+        with self.assertRaisesRegex(sqlite3.OperationalError, 'no enabled model, snapshot, test, unit test or analysis named "nope"'):
             conn.execute("SELECT dbtindb_compile('nope')").fetchone()
         with self.assertRaisesRegex(sqlite3.OperationalError, "unknown option"):
             call(conn, "dbtindb_ls", '{"selec": "x"}')

@@ -18,6 +18,10 @@ pub struct Settings {
     pub snapshot_paths: Vec<String>,
     pub test_paths: Vec<String>,
     pub macro_paths: Vec<String>,
+    pub analysis_paths: Vec<String>,
+    /// Where `{% docs %}` blocks are read from: `docs-paths`, or by
+    /// default every resource path, as in dbt.
+    pub docs_paths: Option<Vec<String>>,
     /// Where `dbt deps` installs packages: `dbt_packages` by default.
     pub packages_install_path: String,
     /// `dispatch:` search orders, by macro namespace: which packages
@@ -43,6 +47,8 @@ impl Default for Settings {
             snapshot_paths: vec!["snapshots".into()],
             test_paths: vec!["tests".into()],
             macro_paths: vec!["macros".into()],
+            analysis_paths: vec!["analyses".into()],
+            docs_paths: None,
             packages_install_path: "dbt_packages".into(),
             dispatch: BTreeMap::new(),
             vars: Map::new(),
@@ -57,6 +63,25 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The directories docs blocks are read from.
+    pub fn docs_roots(&self) -> Vec<String> {
+        match &self.docs_paths {
+            Some(paths) => paths.clone(),
+            None => [
+                &self.model_paths,
+                &self.seed_paths,
+                &self.snapshot_paths,
+                &self.test_paths,
+                &self.macro_paths,
+                &self.analysis_paths,
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect(),
+        }
+    }
+
     pub fn parse(text: &str) -> Result<Self, Error> {
         let doc = yaml::parse(PROJECT_FILE, text)?;
         let doc = doc.as_object().expect("yaml::parse returns a mapping");
@@ -73,6 +98,7 @@ impl Settings {
             ("snapshot-paths", &mut s.snapshot_paths),
             ("test-paths", &mut s.test_paths),
             ("macro-paths", &mut s.macro_paths),
+            ("analysis-paths", &mut s.analysis_paths),
         ] {
             if let Some(v) = doc.get(key) {
                 *slot = string_list(v).ok_or_else(|| field_error(key, "a list of paths"))?;
@@ -114,6 +140,16 @@ impl Settings {
                 *slot =
                     hooks(v).ok_or_else(|| field_error(key, "a string or a list of strings"))?;
             }
+        }
+        if let Some(v) = doc.get("docs-paths") {
+            let paths =
+                string_list(v).ok_or_else(|| field_error("docs-paths", "a list of paths"))?;
+            s.docs_paths = Some(
+                paths
+                    .iter()
+                    .map(|p| p.trim_end_matches('/').to_owned())
+                    .collect(),
+            );
         }
         if let Some(v) = doc.get("packages-install-path") {
             s.packages_install_path = v

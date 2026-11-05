@@ -47,11 +47,11 @@ class LoadTest(unittest.TestCase):
         conn.execute("DELETE FROM dbtindb_files")
         with tempfile.TemporaryDirectory() as d:
             write(d, SHOP)
-            write(d, {"models/tricky.sql": TRICKY, "models/notes.md": "# not loaded", "target/x.sql": "nope"})
+            write(d, {"models/tricky.sql": TRICKY, "models/notes.md": "# docs blocks live here", "target/x.sql": "nope"})
             script, stderr = load(d)
         conn.executescript(script)
         paths = [p for (p,) in conn.execute("SELECT path FROM dbtindb_files ORDER BY 1")]
-        self.assertEqual(paths, sorted(list(SHOP) + ["models/tricky.sql"]))
+        self.assertEqual(paths, sorted(list(SHOP) + ["models/notes.md", "models/tricky.sql"]))
         self.assertEqual(conn.execute("SELECT source FROM dbtindb_files WHERE path = 'models/tricky.sql'").fetchone(), (TRICKY,))
         self.assertIn(f"{len(paths)} files", stderr)
         r = call(conn, "dbtindb_build", json.dumps({"exclude": "tricky"}))

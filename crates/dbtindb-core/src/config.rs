@@ -54,7 +54,9 @@ pub struct Config(pub Map<String, Value>);
 
 impl Config {
     /// Layers `other` over `self` with dbt's rules: `tags` and hooks
-    /// accumulate, `meta` merges key by key, everything else is replaced.
+    /// accumulate, `meta` merges key by key, `grants` privilege by privilege
+    /// (a `+select` key adds grantees instead of replacing them), and
+    /// everything else is replaced.
     pub fn merge(&mut self, other: &Map<String, Value>) {
         for (key, value) in other {
             let key = normalize(key);
@@ -79,6 +81,31 @@ impl Config {
                         meta.extend(m.clone());
                     }
                     self.0.insert(key, Value::Object(meta));
+                }
+                "grants" => {
+                    let mut grants = self
+                        .0
+                        .get("grants")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (privilege, grantees) in value.as_object().into_iter().flatten() {
+                        match privilege.strip_prefix('+') {
+                            Some(privilege) => {
+                                let mut items = as_list(grants.get(privilege));
+                                for g in as_list(Some(grantees)) {
+                                    if !items.contains(&g) {
+                                        items.push(g);
+                                    }
+                                }
+                                grants.insert(privilege.to_owned(), Value::Array(items));
+                            }
+                            None => {
+                                grants.insert(privilege.clone(), grantees.clone());
+                            }
+                        }
+                    }
+                    self.0.insert(key, Value::Object(grants));
                 }
                 _ => {
                     self.0.insert(key, value.clone());
@@ -227,5 +254,18 @@ mod tests {
         assert_eq!(c.tags().unwrap(), ["a", "b"]);
         assert_eq!(c.strings("pre_hook").unwrap(), ["select 1", "select 2"]);
         assert_eq!(c.0["meta"], json!({"x": 1, "y": 2}));
+
+        let mut c = Config::default();
+        c.merge(
+            json!({"grants": {"select": ["a"], "insert": "w"}})
+                .as_object()
+                .unwrap(),
+        );
+        c.merge(
+            json!({"grants": {"+select": ["b", "a"], "insert": []}})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(c.0["grants"], json!({"select": ["a", "b"], "insert": []}));
     }
 }

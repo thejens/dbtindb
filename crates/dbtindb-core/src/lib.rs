@@ -18,6 +18,7 @@ mod seed;
 mod select;
 mod session;
 mod testgen;
+mod unit_test;
 mod yaml;
 
 pub use api::{Invocation, Listed, compile, compile_inline, invoke, load, ls, steps_json};

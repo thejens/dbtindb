@@ -155,10 +155,11 @@ pub fn ls(session: &Session, options: &Options) -> Result<Vec<Listed>, Error> {
 /// dbtindb built its table before.
 pub fn compile(session: &Session, name: &str) -> Result<String, Error> {
     let m = &session.manifest;
-    let node =
-        m.nodes.values().find(|n| n.name == name).ok_or_else(|| {
-            Error::new(format!("no enabled model, snapshot or test named {name:?}"))
-        })?;
+    let node = m.nodes.values().find(|n| n.name == name).ok_or_else(|| {
+        Error::new(format!(
+            "no enabled model, snapshot, test, unit test or analysis named {name:?}"
+        ))
+    })?;
     if node.kind_is_seed() {
         return Err(Error::new(format!("{name:?} is a seed; it has no SQL")));
     }

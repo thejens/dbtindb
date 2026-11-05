@@ -10,6 +10,7 @@ mod api;
 mod builtins;
 mod dbt_macros;
 mod functions;
+mod lookup;
 mod objects;
 mod packages;
 mod relation;
@@ -29,6 +30,7 @@ pub use objects::to_jinja;
 pub use packages::resolve as resolve_macro;
 pub use relation::Relation;
 
+use self::lookup::{doc_fn, env_var_fn, ref_fn, source_fn, var_fn};
 use self::objects::{
     Adapter, Args, ConfigObject, Exceptions, Execute, Impl, ModelObject, NativeFn, This,
 };
@@ -69,6 +71,19 @@ pub struct Current {
     pub parsed_refs: Option<BTreeSet<String>>,
     /// What `store_result()` kept, for `load_result()`.
     pub results: BTreeMap<String, Value>,
+    /// While compiling a unit test: what stands in for the model's inputs.
+    pub fixtures: Option<Fixtures>,
+}
+
+/// A unit test's stand-ins: CTEs for the inputs a model reads, and the
+/// vars and environment it sees.
+#[derive(Clone, Debug, Default)]
+pub struct Fixtures {
+    /// By the unique id of the node `ref()` names.
+    pub refs: BTreeMap<String, Relation>,
+    pub sources: BTreeMap<(String, String), Relation>,
+    pub vars: Map<String, Json>,
+    pub env_vars: Map<String, Json>,
 }
 
 /// The command-line flags of the invocation, as `flags` shows them.
@@ -101,6 +116,8 @@ pub struct Shared {
     pub dispatch: BTreeMap<String, Vec<String>>,
     /// The installed packages' names.
     pub packages: BTreeSet<String>,
+    /// `{% docs %}` blocks, for `doc()`.
+    pub docs: BTreeMap<String, String>,
     pub flags: Mutex<InvocationFlags>,
     pub current: Mutex<Current>,
 }
@@ -249,9 +266,10 @@ pub fn environment(
     env.add_global("run_started_at", functions::run_started_at());
     env.add_global("invocation_id", functions::invocation_id());
 
-    let functions: [(&'static str, Impl); 12] = [
+    let functions: [(&'static str, Impl); 13] = [
         ("ref", ref_fn),
         ("source", source_fn),
+        ("doc", doc_fn),
         ("var", var_fn),
         ("env_var", env_var_fn),
         ("is_incremental", |s, _, _| {
@@ -324,95 +342,6 @@ pub fn macro_names(
         .collect();
     names.sort();
     Ok(names)
-}
-
-fn ref_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
-    if a.kwarg_names().iter().any(|k| k == "v" || k == "version") {
-        return Err(jinja_error("ref() with a model version is not supported"));
-    }
-    let name = match a.positional {
-        [name] => name,
-        [package, name] if package.as_str() == Some(s.project_name.as_str()) => name,
-        [package, _] => {
-            return Err(jinja_error(format!(
-                "ref() to package {package}: packages are not supported"
-            )));
-        }
-        _ => {
-            return Err(jinja_error(
-                "ref() takes the name of a model, seed or snapshot",
-            ));
-        }
-    };
-    let name = name
-        .as_str()
-        .ok_or_else(|| jinja_error("ref(): the name must be a string"))?;
-    let target = s.names.read().unwrap().get(name).cloned();
-    let mut cur = s.current.lock().unwrap();
-    let Some(target) = target else {
-        return Err(jinja_error(format!(
-            "{} refs {name:?}, which is not a model, seed or snapshot in this project",
-            cur.node
-        )));
-    };
-    if !target.enabled {
-        return Err(jinja_error(format!(
-            "{} refs {name:?}, which is disabled (enabled=false)",
-            cur.node
-        )));
-    }
-    if let Some(parsed) = &cur.parsed_refs
-        && !parsed.contains(&target.unique_id)
-    {
-        return Err(jinja_error(format!(
-            "{} refs {name:?} only when executing, so dbtindb cannot order it; \
-                 add `-- depends_on: {{{{ ref('{name}') }}}}` to the file",
-            cur.node
-        )));
-    }
-    cur.refs.insert(target.unique_id.clone());
-    if target.ephemeral && cur.execute {
-        if !cur.ctes.contains(&target.unique_id) {
-            cur.ctes.push(target.unique_id.clone());
-        }
-        return Ok(Relation::cte(s.dialect, name).into_value());
-    }
-    Ok(target.relation.into_value())
-}
-
-fn source_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
-    let source = a.string(0, "source_name")?;
-    let table = a.string(1, "table_name")?;
-    let key = (source.clone(), table.clone());
-    // Without a property file declaring it, the source name is the schema.
-    let (schema, identifier) = match s.sources.get(&key) {
-        Some(t) => (t.schema.clone(), t.identifier.clone()),
-        None => (source, table),
-    };
-    s.current.lock().unwrap().sources.insert(key);
-    Ok(s.relation(&schema, &identifier).into_value())
-}
-
-fn var_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
-    let name = a.string(0, "name")?;
-    match (s.vars.get(&name), a.get(1, "default")) {
-        (Some(v), _) => Ok(Value::from_serialize(v)),
-        (None, Some(d)) => Ok(d),
-        (None, None) => Err(jinja_error(format!(
-            "required var {name:?} not found; pass it in the vars argument or set it in dbt_project.yml"
-        ))),
-    }
-}
-
-/// The database server's environment is not the project's to read; vars
-/// take its place. A default is honoured so projects still compile.
-fn env_var_fn(_: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
-    let name = a.string(0, "var")?;
-    a.get(1, "default").ok_or_else(|| {
-        jinja_error(format!(
-            "env_var({name:?}): environment variables are not available inside the database; use var() instead"
-        ))
-    })
 }
 
 fn run_query_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {

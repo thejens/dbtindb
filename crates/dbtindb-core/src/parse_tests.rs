@@ -211,3 +211,191 @@ fn disabled_nodes_are_dropped_and_cannot_be_referenced() {
     .unwrap();
     assert!(err.0.contains("disabled"), "{err}");
 }
+
+#[test]
+fn analyses_compile_but_are_not_referenceable() {
+    let s = load(
+        &[
+            ("models/a.sql", "select 1 as id"),
+            ("analyses/report.sql", "select count(*) from {{ ref('a') }}"),
+        ],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let report = &s.manifest.nodes["analysis.dbtindb.report"];
+    assert_eq!(report.resource_type, ResourceType::Analysis);
+    assert!(report.relation.is_none());
+    assert!(report.depends_on.contains("model.dbtindb.a"));
+    assert_eq!(
+        crate::compile(&s, "report").unwrap(),
+        "select count(*) from \"analytics\".\"a\""
+    );
+    let err = load(
+        &[
+            ("analyses/report.sql", "select 1"),
+            ("models/b.sql", "select * from {{ ref('report') }}"),
+        ],
+        Dialect::Postgres,
+    )
+    .err()
+    .unwrap();
+    assert!(err.0.contains("report"), "{err}");
+}
+
+#[test]
+fn descriptions_render_docs_blocks() {
+    let s = load(
+        &[
+            ("models/orders.sql", "select 1 as id"),
+            (
+                "models/orders.yml",
+                "version: 2\nmodels:\n  - name: orders\n    description: \"{{ doc('orders') }}\"\n    \
+                 columns:\n      - name: id\n        description: \"{{ doc('dbtindb', 'order_id') }}\"\n",
+            ),
+            (
+                "models/docs.md",
+                "{% docs orders %}\nOne row per {order}.\n{% enddocs %}\n{% docs order_id %}The key.{% enddocs %}",
+            ),
+        ],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let orders = &s.manifest.nodes["model.dbtindb.orders"];
+    assert_eq!(orders.description, "One row per {order}.");
+    assert_eq!(orders.columns[0].description, "The key.");
+    let err = load(
+        &[
+            ("models/a.sql", "select 1"),
+            (
+                "models/a.yml",
+                "version: 2\nmodels:\n  - name: a\n    description: \"{{ doc('nope') }}\"\n",
+            ),
+        ],
+        Dialect::Postgres,
+    )
+    .err()
+    .unwrap();
+    assert!(err.0.contains("no docs block named \"nope\""), "{err}");
+}
+
+#[test]
+fn tests_that_store_failures_get_audit_relations() {
+    let files = [
+        (
+            "dbt_project.yml",
+            "name: dbtindb\ndata_tests:\n  +store_failures: true\n",
+        ),
+        ("models/orders.sql", "select 1 as id"),
+        (
+            "models/orders.yml",
+            "models:\n  - name: orders\n    columns:\n      - name: id\n        data_tests:\n          - unique\n          \
+             - not_null:\n              config: {store_failures_as: ephemeral}\n      \
+             - name: a_column_whose_name_goes_on_and_on_and_on_and_on\n        data_tests:\n          \
+             - accepted_values:\n              values: [1]\n              config: {store_failures_as: view}\n",
+        ),
+    ];
+    let s = load(&files, Dialect::Postgres).unwrap();
+    let rel = |name: &str| {
+        s.manifest
+            .nodes
+            .values()
+            .find(|n| n.name.starts_with(name))
+            .unwrap()
+            .relation
+            .as_ref()
+            .map(|r| r.rendered.clone())
+    };
+    assert_eq!(
+        rel("unique_").as_deref(),
+        Some("\"analytics_dbt_test__audit\".\"unique_orders_id\"")
+    );
+    // accepted_values_orders_a_column_whose_name_goes_on_and_on_and_on_and_on
+    // is too long for an identifier.
+    assert_eq!(
+        rel("accepted_values_").as_deref(),
+        Some(
+            "\"analytics_dbt_test__audit\".\"accepted_values_orders_a_colum_\
+             43968c4bda22a788e4bb2b89d4ef1be8\""
+        )
+    );
+    assert_eq!(rel("not_null_"), None);
+    let s = load(&files, Dialect::Sqlite).unwrap();
+    assert_eq!(
+        s.manifest.nodes["test.dbtindb.unique_orders_id"]
+            .relation
+            .as_ref()
+            .unwrap()
+            .rendered,
+        "\"unique_orders_id\""
+    );
+}
+
+#[test]
+fn yaml_snapshots_snapshot_a_ref_or_source() {
+    let yml = |relation: &str| {
+        format!(
+            "snapshots:\n  - name: snap\n    relation: \"{relation}\"\n    \
+             config: {{unique_key: id, strategy: check, check_cols: all}}\n"
+        )
+    };
+    let ok = yml("ref('m')");
+    let s = load(
+        &[("models/m.sql", "select 1 as id"), ("snapshots/s.yml", &ok)],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let snap = &s.manifest.nodes["snapshot.dbtindb.snap"];
+    assert!(snap.depends_on.contains("model.dbtindb.m"));
+    assert_eq!(snap.path, "snapshots/s.yml");
+    let bad = yml("analytics.m");
+    let err = load(&[("snapshots/s.yml", &bad)], Dialect::Postgres)
+        .err()
+        .unwrap();
+    assert!(err.0.contains("must be a ref() or source() call"), "{err}");
+    let err = load(
+        &[
+            ("models/m.sql", "select 1 as id"),
+            ("snapshots/s.yml", &ok),
+            (
+                "snapshots/snap.sql",
+                "{% snapshot snap %}select 1 as id{% endsnapshot %}",
+            ),
+        ],
+        Dialect::Postgres,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.0
+            .contains("defined both here and in snapshots/snap.sql"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unit_tests_become_nodes_of_their_model() {
+    let unit = "unit_tests:\n  - name: t\n    model: m\n    given: []\n    expect: {rows: []}\n";
+    let s = load(
+        &[("models/m.sql", "select 1 as id"), ("models/u.yml", unit)],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let t = &s.manifest.nodes["unit_test.dbtindb.m.t"];
+    assert_eq!(t.resource_type, ResourceType::UnitTest);
+    assert_eq!(t.depends_on.iter().collect::<Vec<_>>(), ["model.dbtindb.m"]);
+    assert_eq!(t.fqn, ["dbtindb", "m", "t"]);
+
+    let disabled = load(
+        &[
+            ("models/m.sql", "{{ config(enabled=false) }} select 1"),
+            ("models/u.yml", unit),
+        ],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    assert!(disabled.manifest.nodes.is_empty());
+    let err = load(&[("models/u.yml", unit)], Dialect::Postgres)
+        .err()
+        .unwrap();
+    assert!(err.0.contains("tests \"m\", which is not a model"), "{err}");
+}

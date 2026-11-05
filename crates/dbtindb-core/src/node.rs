@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
-use crate::Config;
 use crate::context::Relation;
 use crate::project::ColumnProps;
+use crate::project::unit_tests::UnitTestDef;
+use crate::{Config, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResourceType {
@@ -15,6 +16,8 @@ pub enum ResourceType {
     Seed,
     Snapshot,
     Test,
+    UnitTest,
+    Analysis,
 }
 
 impl ResourceType {
@@ -24,6 +27,8 @@ impl ResourceType {
             ResourceType::Seed => "seed",
             ResourceType::Snapshot => "snapshot",
             ResourceType::Test => "test",
+            ResourceType::UnitTest => "unit_test",
+            ResourceType::Analysis => "analysis",
         }
     }
 }
@@ -75,6 +80,8 @@ pub enum NodeKind {
     /// A `{% snapshot %}` block, called as the macro `snapshot_<name>`.
     Snapshot,
     SingularTest,
+    /// An analysis: compiled, never run.
+    Analysis,
     GenericTest {
         /// The test macro: `test_<name>`.
         macro_name: String,
@@ -83,6 +90,8 @@ pub enum NodeKind {
         target: TestTarget,
         column: Option<String>,
     },
+    /// A dbt 1.8 unit test of a model.
+    UnitTest(Box<UnitTestDef>),
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +105,7 @@ pub struct Node {
     pub fqn: Vec<String>,
     pub config: Config,
     pub kind: NodeKind,
-    /// The relation the node builds; `None` for tests and ephemeral models.
+    /// The relation the node builds; `None` for tests and analyses.
     pub relation: Option<Relation>,
     /// Unique ids of the nodes it depends on.
     pub depends_on: BTreeSet<String>,
@@ -113,12 +122,37 @@ impl Node {
         }
     }
 
+    /// Where a test keeps its failing rows (`store_failures`,
+    /// `store_failures_as`): a table, a view, or nowhere.
+    pub fn stored_failures(&self) -> Result<Option<Materialized>, Error> {
+        if self.resource_type != ResourceType::Test {
+            return Ok(None);
+        }
+        match self.config.str("store_failures_as")? {
+            Some("table") => Ok(Some(Materialized::Table)),
+            Some("view") => Ok(Some(Materialized::View)),
+            Some("ephemeral") => Ok(None),
+            Some(other) => Err(Error::new(format!(
+                "{}: store_failures_as must be table, view or ephemeral, not {other:?}",
+                self.path
+            ))),
+            None => Ok(self
+                .config
+                .bool("store_failures")?
+                .unwrap_or(false)
+                .then_some(Materialized::Table)),
+        }
+    }
+
     pub fn kind_is_seed(&self) -> bool {
         matches!(self.kind, NodeKind::Seed)
     }
 
     pub fn is_test(&self) -> bool {
-        self.resource_type == ResourceType::Test
+        matches!(
+            self.resource_type,
+            ResourceType::Test | ResourceType::UnitTest
+        )
     }
 
     /// The node as Jinja sees it in `model` and in `generate_schema_name`'s

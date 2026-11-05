@@ -1,10 +1,11 @@
 //! Property files (`schema.yml` and friends): descriptions, config, data
-//! tests and sources.
+//! tests, unit tests and sources.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use super::unit_tests::{self, UnitTestDef};
 use crate::{Error, yaml};
 
 /// Everything the project's property files declare, merged.
@@ -13,7 +14,9 @@ pub struct Properties {
     pub models: BTreeMap<String, ResourceProps>,
     pub seeds: BTreeMap<String, ResourceProps>,
     pub snapshots: BTreeMap<String, ResourceProps>,
+    pub analyses: BTreeMap<String, ResourceProps>,
     pub sources: BTreeMap<(String, String), SourceTable>,
+    pub unit_tests: Vec<UnitTestDef>,
 }
 
 /// Properties of one model, seed or snapshot.
@@ -26,6 +29,9 @@ pub struct ResourceProps {
     pub columns: Vec<ColumnProps>,
     /// Tests on the whole resource (not on one column).
     pub tests: Vec<TestDef>,
+    /// A YAML snapshot's `relation:`, the `ref()` or `source()` it
+    /// snapshots.
+    pub relation: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -72,9 +78,13 @@ impl Properties {
             ("models", &mut self.models),
             ("seeds", &mut self.seeds),
             ("snapshots", &mut self.snapshots),
+            ("analyses", &mut self.analyses),
         ] {
             for entry in list(doc.get(key), &ctx(key))? {
-                let props = resource(path, entry)?;
+                let mut props = resource(path, entry)?;
+                if key == "snapshots" {
+                    props.relation = optional_string(entry, "relation")?;
+                }
                 let name = string(entry, "name", &ctx(key))?;
                 if let Some(prev) = target.insert(name.clone(), props) {
                     return Err(Error::new(format!(
@@ -113,6 +123,20 @@ impl Properties {
                 }
             }
         }
+        for entry in list(doc.get("unit_tests"), &ctx("unit_tests"))? {
+            let def = unit_tests::parse(path, entry)?;
+            if let Some(prev) = self
+                .unit_tests
+                .iter()
+                .find(|u| u.model == def.model && u.name == def.name)
+            {
+                return Err(Error::new(format!(
+                    "unit test {:?} of model {:?} is declared in both {} and {path}",
+                    def.name, def.model, prev.file
+                )));
+            }
+            self.unit_tests.push(def);
+        }
         Ok(())
     }
 }
@@ -139,6 +163,7 @@ fn resource(path: &str, entry: &Value) -> Result<ResourceProps, Error> {
         },
         columns,
         tests: tests(entry, &where_)?,
+        relation: None,
     })
 }
 
@@ -208,7 +233,7 @@ fn test_def(item: &Value, where_: &str) -> Result<TestDef, Error> {
     })
 }
 
-fn list<'a>(v: Option<&'a Value>, where_: &str) -> Result<Vec<&'a Value>, Error> {
+pub(super) fn list<'a>(v: Option<&'a Value>, where_: &str) -> Result<Vec<&'a Value>, Error> {
     match v {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => Ok(items.iter().collect()),
@@ -216,14 +241,14 @@ fn list<'a>(v: Option<&'a Value>, where_: &str) -> Result<Vec<&'a Value>, Error>
     }
 }
 
-fn string(v: &Value, key: &str, where_: &str) -> Result<String, Error> {
+pub(super) fn string(v: &Value, key: &str, where_: &str) -> Result<String, Error> {
     v.get(key)
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| Error::new(format!("{where_}: every entry needs a {key}")))
 }
 
-fn optional_string(v: &Value, key: &str) -> Result<Option<String>, Error> {
+pub(super) fn optional_string(v: &Value, key: &str) -> Result<Option<String>, Error> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),

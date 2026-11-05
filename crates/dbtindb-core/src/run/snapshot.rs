@@ -1,19 +1,32 @@
 //! Snapshots: type 2 slowly changing dimensions, with dbt's `timestamp`
 //! and `check` strategies and its `dbt_scd_id`, `dbt_updated_at`,
-//! `dbt_valid_from` and `dbt_valid_to` columns.
+//! `dbt_valid_from` and `dbt_valid_to` columns. Rows deleted from the source can be left alone,
+//! closed (`hard_deletes: invalidate`), or recorded as a new version with
+//! `dbt_is_deleted = 'True'` (`hard_deletes: new_record`).
 
+use crate::context::Relation;
 use crate::node::Node;
 use crate::{Dialect, Error};
 
 use super::materialize::run;
 use super::{Plan, Runner};
 
-const META: [&str; 4] = [
+const META: [&str; 5] = [
     "dbt_scd_id",
     "dbt_updated_at",
     "dbt_valid_from",
     "dbt_valid_to",
+    IS_DELETED,
 ];
+
+const IS_DELETED: &str = "dbt_is_deleted";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HardDeletes {
+    Ignore,
+    Invalidate,
+    NewRecord,
+}
 
 struct Strategy {
     keys: Vec<String>,
@@ -21,7 +34,7 @@ struct Strategy {
     updated: Box<dyn Fn(&str) -> String>,
     /// Whether source row `s` changed from current version `t`.
     changed: String,
-    invalidate_deletes: bool,
+    hard_deletes: HardDeletes,
 }
 
 pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<String>), Error> {
@@ -38,6 +51,7 @@ pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Str
             .map(|c| c.name)
             .collect();
     let st = strategy(node, d, &source_cols)?;
+    let new_record = st.hard_deletes == HardDeletes::NewRecord;
     let scd_id = |alias: &str| {
         let mut parts: Vec<String> = st
             .keys
@@ -49,8 +63,15 @@ pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Str
     };
 
     let action = if plan == Plan::Update {
-        // Columns the source gained since the last run.
+        // Columns the source gained since the last run, and the deleted
+        // flag of a snapshot that switched to `new_record`.
         let existing = r.db.columns(&rel.schema, &rel.identifier)?;
+        if new_record && !existing.iter().any(|e| e.name == IS_DELETED) {
+            stmts.push(run(
+                r,
+                format!("ALTER TABLE {} ADD COLUMN {IS_DELETED} TEXT", rel.rendered),
+            )?);
+        }
         for c in r.db.columns(d.temp_schema(), &tmp)? {
             if !existing.iter().any(|e| e.name == c.name) {
                 let ty = if c.data_type.is_empty() {
@@ -74,6 +95,12 @@ pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Str
             .map(|k| format!("s.{k} = t.{k}"))
             .collect::<Vec<_>>()
             .join(" AND ");
+        // A row that comes back after being deleted is a change too.
+        let changed = if new_record {
+            format!("({}) OR t.{IS_DELETED} = 'True'", st.changed)
+        } else {
+            st.changed.clone()
+        };
         // Close the current version of every changed row ...
         stmts.push(run(
             r,
@@ -82,11 +109,12 @@ pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Str
                  WHERE t.dbt_valid_to IS NULL\n  AND EXISTS (SELECT 1 FROM {tmp_q} AS s WHERE {key_match} AND ({changed}))",
                 rel = rel.rendered,
                 upd = (st.updated)("s"),
-                changed = st.changed,
             ),
         )?);
         // ... and of rows that disappeared from the source ...
-        if st.invalidate_deletes {
+        if new_record {
+            record_deletions(r, rel, &tmp, &key_match, &st.keys, &mut stmts)?;
+        } else if st.hard_deletes == HardDeletes::Invalidate {
             stmts.push(run(
                 r,
                 format!(
@@ -108,11 +136,16 @@ pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Str
             .map(|c| format!("s.{}", d.quote(c)))
             .collect::<Vec<_>>()
             .join(", ");
+        let (flag_col, flag) = if new_record {
+            (format!(", {IS_DELETED}"), ", 'False'")
+        } else {
+            (String::new(), "")
+        };
         stmts.push(run(
             r,
             format!(
-                "INSERT INTO {rel} ({list}, dbt_scd_id, dbt_updated_at, dbt_valid_from, dbt_valid_to)\n\
-                 SELECT {s_list}, {id}, {upd}, {upd}, NULL\nFROM {tmp_q} AS s\n\
+                "INSERT INTO {rel} ({list}, dbt_scd_id, dbt_updated_at, dbt_valid_from, dbt_valid_to{flag_col})\n\
+                 SELECT {s_list}, {id}, {upd}, {upd}, NULL{flag}\nFROM {tmp_q} AS s\n\
                  WHERE NOT EXISTS (SELECT 1 FROM {rel} AS t WHERE {key_match} AND t.dbt_valid_to IS NULL)",
                 rel = rel.rendered,
                 id = scd_id("s"),
@@ -126,9 +159,14 @@ pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Str
             r,
             format!(
                 "CREATE TABLE {} AS\nSELECT s.*, {id} AS dbt_scd_id, {upd} AS dbt_updated_at, \
-                 {upd} AS dbt_valid_from, nullif({upd}, {upd}) AS dbt_valid_to\nFROM {tmp_q} AS s",
+                 {upd} AS dbt_valid_from, nullif({upd}, {upd}) AS dbt_valid_to{flag}\nFROM {tmp_q} AS s",
                 rel.rendered,
                 id = scd_id("s"),
+                flag = if new_record {
+                    format!(", 'False' AS {IS_DELETED}")
+                } else {
+                    String::new()
+                },
             ),
         )?);
         "create snapshot"
@@ -136,6 +174,82 @@ pub fn build(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Str
     stmts.push(run(r, format!("DROP TABLE {tmp_q}"))?);
     r.managed.record(rel, &node.unique_id, "snapshot", None)?;
     Ok((action.into(), stmts))
+}
+
+/// `hard_deletes: new_record`: closes the current version of every row
+/// that left the source and adds a version flagged as deleted. The deleted
+/// rows are gathered first so both get the same timestamp.
+fn record_deletions(
+    r: &Runner<'_>,
+    rel: &Relation,
+    tmp: &str,
+    key_match: &str,
+    keys: &[String],
+    stmts: &mut Vec<String>,
+) -> Result<(), Error> {
+    let d = r.db.dialect();
+    let gone = format!("{tmp}_deleted");
+    let gone_q = d.quote(&gone);
+    let tmp_q = d.quote(tmp);
+    let current =
+        format!("t.dbt_valid_to IS NULL AND (t.{IS_DELETED} IS NULL OR t.{IS_DELETED} <> 'True')");
+    stmts.push(run(
+        r,
+        d.create_temp_table_as(
+            &gone,
+            &format!(
+                "SELECT t.*, {now} AS dbt_deleted_at FROM {rel} AS t\n\
+                 WHERE {current}\n  AND NOT EXISTS (SELECT 1 FROM {tmp_q} AS s WHERE {key_match})",
+                rel = rel.rendered,
+                now = d.now(),
+            ),
+        ),
+    )?);
+    let gone_match = keys
+        .iter()
+        .map(|k| format!("g.{k} = t.{k}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    stmts.push(run(
+        r,
+        format!(
+            "UPDATE {rel} AS t SET dbt_valid_to = (SELECT g.dbt_deleted_at FROM {gone_q} AS g WHERE {gone_match})\n\
+             WHERE {current}\n  AND EXISTS (SELECT 1 FROM {gone_q} AS g WHERE {gone_match})",
+            rel = rel.rendered,
+        ),
+    )?);
+    let cols: Vec<String> =
+        r.db.columns(&rel.schema, &rel.identifier)?
+            .into_iter()
+            .map(|c| c.name)
+            .filter(|c| !META.contains(&c.as_str()))
+            .collect();
+    let list = cols
+        .iter()
+        .map(|c| d.quote(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let g_list = cols
+        .iter()
+        .map(|c| format!("g.{}", d.quote(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut id_parts: Vec<String> = keys
+        .iter()
+        .map(|k| d.text_or_empty(&format!("g.{k}")))
+        .collect();
+    id_parts.push(d.text_or_empty("g.dbt_deleted_at"));
+    stmts.push(run(
+        r,
+        format!(
+            "INSERT INTO {rel} ({list}, dbt_scd_id, dbt_updated_at, dbt_valid_from, dbt_valid_to, {IS_DELETED})\n\
+             SELECT {g_list}, {id}, g.dbt_deleted_at, g.dbt_deleted_at, NULL, 'True'\nFROM {gone_q} AS g",
+            rel = rel.rendered,
+            id = d.md5(&id_parts.join(" || '|' || ")),
+        ),
+    )?);
+    stmts.push(run(r, format!("DROP TABLE {gone_q}"))?);
+    Ok(())
 }
 
 fn strategy(node: &Node, d: Dialect, source_cols: &[String]) -> Result<Strategy, Error> {
@@ -150,16 +264,20 @@ fn strategy(node: &Node, d: Dialect, source_cols: &[String]) -> Result<Strategy,
             "the query must not return a column named {bad}"
         )));
     }
-    let invalidate_deletes = c.bool("invalidate_hard_deletes")?.unwrap_or(false)
-        || match c.str("hard_deletes")? {
-            None | Some("ignore") => false,
-            Some("invalidate") => true,
-            Some(other) => {
-                return Err(err(&format!(
-                    "hard_deletes {other:?} is not supported (ignore, invalidate)"
-                )));
-            }
-        };
+    let hard_deletes = match c.str("hard_deletes")? {
+        Some("new_record") => HardDeletes::NewRecord,
+        Some("invalidate") => HardDeletes::Invalidate,
+        // The pre-1.9 spelling of `invalidate`.
+        None | Some("ignore") if c.bool("invalidate_hard_deletes")?.unwrap_or(false) => {
+            HardDeletes::Invalidate
+        }
+        None | Some("ignore") => HardDeletes::Ignore,
+        Some(other) => {
+            return Err(err(&format!(
+                "hard_deletes {other:?} is not supported (ignore, invalidate, new_record)"
+            )));
+        }
+    };
     match c.str("strategy")? {
         Some("timestamp") => {
             let col = c
@@ -171,7 +289,7 @@ fn strategy(node: &Node, d: Dialect, source_cols: &[String]) -> Result<Strategy,
                 keys,
                 updated: Box::new(move |a| format!("{a}.{col}")),
                 changed,
-                invalidate_deletes,
+                hard_deletes,
             })
         }
         Some("check") => {
@@ -197,7 +315,7 @@ fn strategy(node: &Node, d: Dialect, source_cols: &[String]) -> Result<Strategy,
                 keys,
                 updated: Box::new(move |_| now.clone()),
                 changed,
-                invalidate_deletes,
+                hard_deletes,
             })
         }
         Some(other) => Err(err(&format!(
