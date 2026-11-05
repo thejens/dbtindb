@@ -2,10 +2,12 @@
 //! `ref()` and `source()` it reads (and `this`, when it runs
 //! incrementally) replaced by a CTE of fixture rows.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
 use crate::compile::{inject_ctes, trim_statement};
-use crate::context::{Fixtures, Relation};
+use crate::context::{Fixtures, Relation, overriding};
 use crate::node::{Node, NodeKind};
 use crate::project::unit_tests::{Rows, UnitTestDef};
 use crate::session::Session;
@@ -14,7 +16,8 @@ use crate::{Column, Config, Dialect, Error, SeedType, seed};
 /// What a `given:` entry stands in for.
 #[derive(Debug, PartialEq)]
 enum Input {
-    Ref(String),
+    /// `ref('name')` or `ref('package', 'name')`.
+    Ref(Option<String>, String),
     Source(String, String),
     This,
 }
@@ -34,21 +37,26 @@ impl Session {
             env_vars: def.env_vars.clone(),
             ..Fixtures::default()
         };
+        let overrides = self.macro_overrides(&def.macros).map_err(err)?;
         let mut this = None;
         let mut defs = Vec::new();
         for given in &def.given {
             let input = parse_input(&given.input).map_err(err)?;
+            let mut ref_target = None;
             let (cte_name, real) = match &input {
-                Input::Ref(name) => {
-                    let target = self.shared.names.read().unwrap().get(name).cloned();
-                    let target = target.ok_or_else(|| {
-                        err(format!(
-                            "given {} is not a model, seed or snapshot",
-                            given.input
-                        ))
-                    })?;
-                    let real = (!target.ephemeral).then_some(target.relation);
-                    (name.clone(), real)
+                Input::Ref(package, name) => {
+                    let target = self
+                        .shared
+                        .resolve_ref(package.as_deref(), name, &model.package)
+                        .map_err(|e| err(format!("given {}: {e}", given.input)))?;
+                    let real = (!target.ephemeral).then_some(target.relation.clone());
+                    ref_target = Some(target.unique_id);
+                    // Named inputs of two packages can share a model name.
+                    let cte_name = match package {
+                        Some(package) => format!("{package}_{name}"),
+                        None => name.clone(),
+                    };
+                    (cte_name, real)
                 }
                 Input::Source(source, table) => {
                     let (schema, identifier) =
@@ -79,8 +87,8 @@ impl Session {
             let cte = Relation::cte(d, &format!("fixture_{cte_name}"));
             defs.push((cte.rendered.clone(), sql));
             match input {
-                Input::Ref(name) => {
-                    let uid = self.shared.names.read().unwrap()[&name].unique_id.clone();
+                Input::Ref(..) => {
+                    let uid = ref_target.expect("a ref input resolves to a node");
                     fixtures.refs.insert(uid, cte);
                 }
                 Input::Source(s, t) => {
@@ -103,7 +111,7 @@ impl Session {
                 cur.this = this;
             }
         }
-        let rendered = self.render_file(&model.path);
+        let rendered = self.render_file_with(&model.path, overrides);
         let cur = self.shared.finish();
         let rendered = rendered.map_err(|e| err(format!("compiling {}: {e}", model.path)))?;
         // An input given but never read is a mistake in the test, as in dbt.
@@ -116,13 +124,53 @@ impl Session {
         Ok(inject_ctes(&trim_statement(&rendered), &defs))
     }
 
+    /// What `overrides: {macros: ...}` puts in the model's context: each
+    /// named macro replaced by one that returns the given value. As in
+    /// dbt, this changes what the model's own SQL calls, not what other
+    /// macros call.
+    fn macro_overrides(&self, macros: &Map<String, Value>) -> Result<minijinja::Value, String> {
+        let mut bare = BTreeMap::new();
+        let mut namespaced: BTreeMap<String, BTreeMap<String, minijinja::Value>> = BTreeMap::new();
+        for (name, value) in macros {
+            if !self.has_macro(name) {
+                return Err(format!(
+                    "overrides.macros names {name:?}, which is not a macro"
+                ));
+            }
+            let fixed = overriding(value);
+            match name.split_once('.') {
+                Some((package, macro_name)) => {
+                    // dbt's own macros are also called bare.
+                    if package == crate::context::DBT_PACKAGE {
+                        bare.insert(macro_name.to_owned(), fixed.clone());
+                    }
+                    namespaced
+                        .entry(package.to_owned())
+                        .or_default()
+                        .insert(macro_name.to_owned(), fixed);
+                }
+                None => {
+                    bare.insert(name.clone(), fixed);
+                }
+            }
+        }
+        for (package, names) in namespaced {
+            let original = self.env.get_global(&package);
+            bare.insert(
+                package,
+                crate::context::overridden_namespace(original, names),
+            );
+        }
+        Ok(minijinja::Value::from_iter(bare))
+    }
+
     /// The model a unit test tests.
     pub fn unit_test_model<'a>(
         &'a self,
         node: &Node,
         def: &UnitTestDef,
     ) -> Result<&'a Node, Error> {
-        let uid = format!("model.{}.{}", self.shared.project_name, def.model);
+        let uid = format!("model.{}.{}", node.package, def.model);
         self.manifest.nodes.get(&uid).ok_or_else(|| {
             Error::new(format!(
                 "{}: unit test {}: there is no enabled model named {:?}",
@@ -159,7 +207,8 @@ fn parse_input(input: &str) -> Result<Input, String> {
         })
         .collect::<Result<_, _>>()?;
     match (func.trim(), args.as_slice()) {
-        ("ref", [name]) | ("ref", [_, name]) => Ok(Input::Ref(name.clone())),
+        ("ref", [name]) => Ok(Input::Ref(None, name.clone())),
+        ("ref", [package, name]) => Ok(Input::Ref(Some(package.clone()), name.clone())),
         ("source", [source, table]) => Ok(Input::Source(source.clone(), table.clone())),
         _ => Err(bad()),
     }
@@ -286,8 +335,11 @@ mod tests {
 
     #[test]
     fn parses_inputs() {
-        assert_eq!(parse_input("ref('a')"), Ok(Input::Ref("a".into())));
-        assert_eq!(parse_input("ref(\"p\", \"a\")"), Ok(Input::Ref("a".into())));
+        assert_eq!(parse_input("ref('a')"), Ok(Input::Ref(None, "a".into())));
+        assert_eq!(
+            parse_input("ref(\"p\", \"a\")"),
+            Ok(Input::Ref(Some("p".into()), "a".into()))
+        );
         assert_eq!(
             parse_input("source('raw', 'orders')"),
             Ok(Input::Source("raw".into(), "orders".into()))

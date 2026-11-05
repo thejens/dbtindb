@@ -14,9 +14,10 @@ pub struct File {
 }
 
 /// What dbtindb reads under the project's paths (`.md` for `{% docs %}`
-/// blocks); everything else (`target/`, editor files) stays out of the
+/// blocks, `.py` so that Python models are reported rather than silently
+/// left out); everything else (`target/`, editor files) stays out of the
 /// database.
-const EXTENSIONS: &[&str] = &["sql", "yml", "yaml", "csv", "md"];
+const EXTENSIONS: &[&str] = &["sql", "yml", "yaml", "csv", "md", "py"];
 
 /// Files dbt would use but dbtindb cannot, reported as warnings.
 const UNSUPPORTED: &[(&str, &str)] = &[(

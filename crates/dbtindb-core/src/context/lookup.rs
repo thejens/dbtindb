@@ -2,6 +2,7 @@
 //! `var` and `env_var`. While a unit test compiles, they answer from its
 //! fixtures and overrides.
 
+use minijinja::constants::TARGET_PACKAGE_NAME;
 use minijinja::{Error, State, Value};
 
 use super::objects::Args;
@@ -11,31 +12,28 @@ pub(super) fn ref_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Valu
     if a.kwarg_names().iter().any(|k| k == "v" || k == "version") {
         return Err(jinja_error("ref() with a model version is not supported"));
     }
-    let name = match a.positional {
-        [name] => name,
-        [package, name] if package.as_str() == Some(s.project_name.as_str()) => name,
-        [package, _] => {
-            return Err(jinja_error(format!(
-                "ref() to package {package}: packages are not supported"
-            )));
-        }
+    let (package, name) = match a.positional {
+        [name] => (None, name),
+        [package, name] => (
+            Some(
+                package
+                    .as_str()
+                    .ok_or_else(|| jinja_error("ref(): the package must be a string"))?,
+            ),
+            name,
+        ),
         _ => {
             return Err(jinja_error(
-                "ref() takes the name of a model, seed or snapshot",
+                "ref() takes the name of a model, seed or snapshot, and optionally its package first",
             ));
         }
     };
     let name = name
         .as_str()
         .ok_or_else(|| jinja_error("ref(): the name must be a string"))?;
-    let target = s.names.read().unwrap().get(name).cloned();
+    let target = s.resolve_ref(package, name, &s.current_package());
     let mut cur = s.current.lock().unwrap();
-    let Some(target) = target else {
-        return Err(jinja_error(format!(
-            "{} refs {name:?}, which is not a model, seed or snapshot in this project",
-            cur.node
-        )));
-    };
+    let target = target.map_err(|e| jinja_error(format!("{} refs {name:?}: {e}", cur.node)))?;
     if !target.enabled {
         return Err(jinja_error(format!(
             "{} refs {name:?}, which is disabled (enabled=false)",
@@ -93,25 +91,44 @@ pub(super) fn source_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<V
     Ok(s.relation(&schema, &identifier).into_value())
 }
 
-/// `doc('name')`, or `doc('<project>', 'name')`: a docs block's text.
-pub(super) fn doc_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
-    let name = match a.positional {
-        [name] => name,
-        [package, name] if package.as_str() == Some(s.project_name.as_str()) => name,
-        [package, _] => {
-            return Err(jinja_error(format!(
-                "doc(): docs blocks of package {package} are not loaded; only this project's are"
-            )));
-        }
+/// `doc('name')`, or `doc('<package>', 'name')`: a docs block's text.
+///
+/// As in dbt, a bare name is looked up in the root project, then in the
+/// package being rendered, then in the one package that has it.
+pub(super) fn doc_fn(s: &Shared, state: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {
+    let (package, name) = match a.positional {
+        [name] => (None, name),
+        [package, name] => (package.as_str(), name),
         _ => return Err(jinja_error("doc() takes the name of a docs block")),
     };
     let name = name
         .as_str()
         .ok_or_else(|| jinja_error("doc(): the name must be a string"))?;
-    s.docs
-        .get(name)
-        .map(|text| Value::from(text.as_str()))
-        .ok_or_else(|| jinja_error(format!("doc(): there is no docs block named {name:?}")))
+    let in_package = |pkg: &str| s.docs.get(pkg).and_then(|d| d.get(name));
+    let text = match package {
+        Some(package) => in_package(package),
+        None => {
+            let current = state
+                .lookup(TARGET_PACKAGE_NAME, &[])
+                .and_then(|v| v.as_str().map(str::to_owned));
+            let mut anywhere = s.docs.values().filter_map(|d| d.get(name));
+            in_package(&s.project_name)
+                .or_else(|| current.as_deref().and_then(in_package))
+                .or_else(|| match (anywhere.next(), anywhere.next()) {
+                    (Some(text), None) => Some(text),
+                    _ => None,
+                })
+        }
+    };
+    text.map(|t| Value::from(t.as_str())).ok_or_else(|| {
+        jinja_error(match package {
+            Some(p) => format!("doc(): package {p:?} has no docs block named {name:?}"),
+            None => format!(
+                "doc(): there is no docs block named {name:?}, or several packages have one; \
+                 name the package: doc('<package>', {name:?})"
+            ),
+        })
+    })
 }
 
 pub(super) fn var_fn(s: &Shared, _: &State<'_, '_>, a: &Args<'_>) -> Result<Value, Error> {

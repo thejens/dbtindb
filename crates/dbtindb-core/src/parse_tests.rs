@@ -399,3 +399,35 @@ fn unit_tests_become_nodes_of_their_model() {
         .unwrap();
     assert!(err.0.contains("tests \"m\", which is not a model"), "{err}");
 }
+
+#[test]
+fn configs_that_would_change_the_build_are_errors() {
+    for (config, msg) in [
+        ("contract={'enforced': true}", "enforced model contracts"),
+        ("incremental_predicates=['a > 1']", "incremental_predicates"),
+    ] {
+        let model = format!("{{{{ config({config}) }}}} select 1");
+        let err = load(&[("models/m.sql", &model)], Dialect::Postgres)
+            .err()
+            .unwrap();
+        assert!(err.0.contains(msg), "{err}");
+    }
+    // An unenforced contract changes nothing in dbt either.
+    load(
+        &[(
+            "models/m.sql",
+            "{{ config(contract={'enforced': false}) }} select 1",
+        )],
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let err = Project::new([
+        ("models/m.sql".to_owned(), "select 1".to_owned()),
+        (
+            "models/s.yml".to_owned(),
+            "models:\n  - name: m\n    versions: [{v: 1}]\n".to_owned(),
+        ),
+    ])
+    .unwrap_err();
+    assert!(err.0.contains("model versions"), "{err}");
+}

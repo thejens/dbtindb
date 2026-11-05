@@ -8,6 +8,8 @@ mod error;
 mod graph;
 mod node;
 #[cfg(test)]
+mod package_model_tests;
+#[cfg(test)]
 mod package_tests;
 mod parse;
 #[cfg(test)]

@@ -10,7 +10,7 @@ use serde_json::Value as Json;
 use crate::Error;
 use crate::config::Config;
 use crate::node::{Node, NodeKind, ResourceType, TestTarget};
-use crate::parse::render_for_parse;
+use crate::parse::{project_config, render_for_parse, unique_id};
 use crate::project::{ColumnProps, TestDef};
 use crate::session::Session;
 
@@ -22,44 +22,48 @@ struct Pending<'a> {
     target_name: String,
     column: Option<String>,
     file: &'a str,
+    /// The project or package whose property file applies the test.
+    package: &'a str,
 }
 
 pub fn tests(session: &Session, nodes: &BTreeMap<String, Node>) -> Result<Vec<Node>, Error> {
-    let project = &session.project;
-    let pkg = &session.shared.project_name;
     let mut pending = Vec::new();
-    let props = &project.properties;
-    for (rt, entries) in [
-        (ResourceType::Model, &props.models),
-        (ResourceType::Seed, &props.seeds),
-        (ResourceType::Snapshot, &props.snapshots),
-    ] {
-        for (name, p) in entries {
-            let uid = format!("{}.{pkg}.{name}", rt.as_str());
-            // Tests of a disabled node are disabled with it.
-            if !nodes.contains_key(&uid) {
-                continue;
+    for (package, _, r) in session.project.all() {
+        let props = &r.properties;
+        for (rt, entries) in [
+            (ResourceType::Model, &props.models),
+            (ResourceType::Seed, &props.seeds),
+            (ResourceType::Snapshot, &props.snapshots),
+        ] {
+            for (name, p) in entries {
+                let uid = unique_id(rt, package, name);
+                // Tests of a disabled node are disabled with it.
+                if !nodes.contains_key(&uid) {
+                    continue;
+                }
+                collect(
+                    &mut pending,
+                    &p.tests,
+                    &p.columns,
+                    TestTarget::Node(uid),
+                    name,
+                    &p.file,
+                    package,
+                );
             }
+        }
+        for ((source, table), t) in &props.sources {
+            let target = TestTarget::Source(source.clone(), table.clone());
             collect(
                 &mut pending,
-                &p.tests,
-                &p.columns,
-                TestTarget::Node(uid),
-                name,
-                &p.file,
+                &t.tests,
+                &t.columns,
+                target,
+                &format!("source_{source}_{table}"),
+                &t.file,
+                package,
             );
         }
-    }
-    for ((source, table), t) in &props.sources {
-        let target = TestTarget::Source(source.clone(), table.clone());
-        collect(
-            &mut pending,
-            &t.tests,
-            &t.columns,
-            target,
-            &format!("source_{source}_{table}"),
-            &t.file,
-        );
     }
 
     let mut used: BTreeSet<String> = nodes.values().map(|n| n.name.clone()).collect();
@@ -70,31 +74,34 @@ pub fn tests(session: &Session, nodes: &BTreeMap<String, Node>) -> Result<Vec<No
             out.push(node);
         }
     }
-    for file in project.singular_tests.values() {
-        if !used.insert(file.name.clone()) {
-            return Err(Error::new(format!(
-                "{}: a test named {:?} already exists",
-                file.path, file.name
-            )));
-        }
-        let mut fqn = vec![pkg.clone()];
-        fqn.extend(file.dirs.iter().cloned());
-        fqn.push(file.name.clone());
-        let mut node = test_node(
-            session,
-            &file.name,
-            &file.path,
-            fqn,
-            Config::default(),
-            NodeKind::SingularTest,
-        );
-        let cur = render_for_parse(session, &node, |s| s.render_file(&file.path).map(|_| ()))
-            .map_err(|e| Error::new(format!("parsing {}: {e}", file.path)))?;
-        node.config = cur.config;
-        node.depends_on = cur.refs;
-        node.sources = cur.sources;
-        if node.config.enabled()? {
-            out.push(node);
+    for (package, _, r) in session.project.all() {
+        for file in r.singular_tests.values() {
+            if !used.insert(file.name.clone()) {
+                return Err(Error::new(format!(
+                    "{}: a test named {:?} already exists",
+                    file.path, file.name
+                )));
+            }
+            let mut fqn = vec![package.to_owned()];
+            fqn.extend(file.dirs.iter().cloned());
+            fqn.push(file.name.clone());
+            let config = project_config(session, ResourceType::Test, package, &fqn);
+            let mut node = test_node(
+                &file.name,
+                package,
+                &file.path,
+                fqn,
+                config,
+                NodeKind::SingularTest,
+            );
+            let cur = render_for_parse(session, &node, |s| s.render_file(&file.path).map(|_| ()))
+                .map_err(|e| Error::new(format!("parsing {}: {e}", file.path)))?;
+            node.config = cur.config;
+            node.depends_on = cur.refs;
+            node.sources = cur.sources;
+            if node.config.enabled()? {
+                out.push(node);
+            }
         }
     }
     Ok(out)
@@ -107,6 +114,7 @@ fn collect<'a>(
     target: TestTarget,
     target_name: &str,
     file: &'a str,
+    package: &'a str,
 ) {
     for def in tests {
         pending.push(Pending {
@@ -115,6 +123,7 @@ fn collect<'a>(
             target_name: target_name.to_owned(),
             column: None,
             file,
+            package,
         });
     }
     for col in columns {
@@ -125,6 +134,7 @@ fn collect<'a>(
                 target_name: target_name.to_owned(),
                 column: Some(col.name.clone()),
                 file,
+                package,
             });
         }
     }
@@ -137,10 +147,11 @@ fn generic(
     used: &mut BTreeSet<String>,
 ) -> Result<Node, Error> {
     // `dbt_utils.at_least_one` is the `{% test at_least_one %}` block of
-    // the dbt_utils package; a bare name is looked up as any macro is.
+    // the dbt_utils package; a bare name is looked up as any macro is,
+    // from the package that applies the test.
     let macro_name = match p.def.test.split_once('.') {
         Some((package, test)) => format!("{package}.test_{test}"),
-        None => format!("test_{}", p.def.test),
+        None => session.macro_for(p.package, &format!("test_{}", p.def.test)),
     };
     if !session.has_macro(&macro_name) {
         return Err(Error::new(format!(
@@ -178,16 +189,12 @@ fn generic(
         name = format!("{base}_{n}");
     }
 
-    let pkg = &session.shared.project_name;
-    let mut fqn = vec![pkg.clone()];
+    let mut fqn = vec![p.package.to_owned()];
     // The property file's directories below its resource path, as dbt
     // places tests in the folder tree of dbt_project.yml.
-    let parts: Vec<&str> = p.file.split('/').collect();
-    if parts.len() > 2 {
-        fqn.extend(parts[1..parts.len() - 1].iter().map(|d| d.to_string()));
-    }
+    fqn.extend(session.project.declared_in(p.file, &name).dirs);
     fqn.push(name.clone());
-    let mut config = Config::from_project(&session.project.settings.tests, &fqn);
+    let mut config = project_config(session, ResourceType::Test, p.package, &fqn);
     config.merge(&p.def.config);
     let kind = NodeKind::GenericTest {
         macro_name,
@@ -195,7 +202,7 @@ fn generic(
         target: p.target.clone(),
         column: p.column.clone(),
     };
-    let mut node = test_node(session, &name, p.file, fqn, config, kind);
+    let mut node = test_node(&name, p.package, p.file, fqn, config, kind);
     match &p.target {
         TestTarget::Node(uid) => {
             node.depends_on.insert(uid.clone());
@@ -216,17 +223,18 @@ fn generic(
 }
 
 fn test_node(
-    session: &Session,
     name: &str,
+    package: &str,
     path: &str,
     fqn: Vec<String>,
     config: Config,
     kind: NodeKind,
 ) -> Node {
     Node {
-        unique_id: format!("test.{}.{name}", session.shared.project_name),
+        unique_id: unique_id(ResourceType::Test, package, name),
         resource_type: ResourceType::Test,
         name: name.to_owned(),
+        package: package.to_owned(),
         path: path.to_owned(),
         fqn,
         config,
