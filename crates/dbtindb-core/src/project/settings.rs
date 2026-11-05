@@ -82,6 +82,24 @@ impl Settings {
         }
     }
 
+    /// These settings with every resource path under `dir`: how the files
+    /// of a package installed in `dir` are found.
+    pub fn rooted(&self, dir: &str) -> Settings {
+        let root = |paths: &[String]| -> Vec<String> {
+            paths.iter().map(|p| format!("{dir}/{p}")).collect()
+        };
+        Settings {
+            model_paths: root(&self.model_paths),
+            seed_paths: root(&self.seed_paths),
+            snapshot_paths: root(&self.snapshot_paths),
+            test_paths: root(&self.test_paths),
+            macro_paths: root(&self.macro_paths),
+            analysis_paths: root(&self.analysis_paths),
+            docs_paths: self.docs_paths.as_deref().map(root),
+            ..self.clone()
+        }
+    }
+
     pub fn parse(text: &str) -> Result<Self, Error> {
         let doc = yaml::parse(PROJECT_FILE, text)?;
         let doc = doc.as_object().expect("yaml::parse returns a mapping");

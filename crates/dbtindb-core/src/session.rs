@@ -61,10 +61,13 @@ impl Session {
             vars: all_vars,
             db,
             names: RwLock::new(BTreeMap::new()),
-            sources: project.properties.sources.clone(),
+            sources: project.sources()?,
             dispatch: project.settings.dispatch.clone(),
             packages: project.packages.keys().cloned().collect(),
-            docs: project.docs.clone(),
+            docs: project
+                .all()
+                .map(|(name, _, r)| (name.to_owned(), r.docs.clone()))
+                .collect(),
             flags: Mutex::new(InvocationFlags::default()),
             current: Mutex::new(Current::default()),
         });
@@ -114,6 +117,20 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// The macro a bare `name` means for a node of `package`, as dbt
+    /// resolves it: the root project's, else the package's own, else
+    /// dbt's. Returned as a name [`Session::call_macro`] takes.
+    pub fn macro_for(&self, package: &str, name: &str) -> String {
+        let root = &self.shared.project_name;
+        if package != root
+            && !self.has_macro(&format!("{root}.{name}"))
+            && self.has_macro(&format!("{package}.{name}"))
+        {
+            return format!("{package}.{name}");
+        }
+        name.to_owned()
+    }
+
     /// Sets what `flags` reports for this invocation.
     pub fn set_flags(&self, which: &'static str, full_refresh: bool) {
         *self.shared.flags.lock().unwrap() = InvocationFlags {
@@ -127,12 +144,18 @@ impl Session {
         Ok(self.env.get_template(path)?.render((), &[])?)
     }
 
+    /// Renders a template file with the context of the current node, and
+    /// `vars` in front of it: what the template's own names resolve to.
+    pub fn render_file_with(&self, path: &str, vars: Value) -> Result<String, Error> {
+        Ok(self.env.get_template(path)?.render(vars, &[])?)
+    }
+
     /// Renders a template given as text (hooks, test arguments).
     pub fn render_str(&self, name: &str, source: &str) -> Result<String, Error> {
         Ok(self.env.render_named_str(name, source, (), &[])?)
     }
 
     pub fn node_json(&self, unique_id: &str) -> Map<String, Json> {
-        self.manifest.nodes[unique_id].to_json(&self.shared.project_name)
+        self.manifest.nodes[unique_id].to_json()
     }
 }

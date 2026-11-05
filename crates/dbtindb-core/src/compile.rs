@@ -103,7 +103,9 @@ impl Session {
             NodeKind::Model(_) | NodeKind::SingularTest | NodeKind::Analysis => {
                 self.render_file(&node.path)
             }
-            NodeKind::Snapshot => self.call_macro(&format!("snapshot_{}", node.name), &[]),
+            NodeKind::Snapshot => {
+                self.call_macro(&format!("{}.snapshot_{}", node.package, node.name), &[])
+            }
             NodeKind::GenericTest { target, .. } => {
                 testgen::tested_relation(self, &self.manifest.nodes, target)
                     .and_then(|rel| testgen::call_test(self, node, rel))

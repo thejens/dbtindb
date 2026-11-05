@@ -12,6 +12,7 @@ mod dbt_macros;
 mod functions;
 mod lookup;
 mod objects;
+mod overrides;
 mod packages;
 mod relation;
 mod statements;
@@ -27,7 +28,8 @@ use minijinja::{Environment, Error, ErrorKind, State, Value};
 use serde_json::{Map, Value as Json};
 
 pub use objects::to_jinja;
-pub use packages::resolve as resolve_macro;
+pub use overrides::{overridden_namespace, overriding};
+pub use packages::{DBT as DBT_PACKAGE, in_package, resolve as resolve_macro};
 pub use relation::Relation;
 
 use self::lookup::{doc_fn, env_var_fn, ref_fn, source_fn, var_fn};
@@ -44,6 +46,8 @@ const FUEL: u64 = 50_000_000;
 /// What `ref('<name>')` resolves to.
 #[derive(Clone, Debug)]
 pub struct RefTarget {
+    /// The project or package that defines it.
+    pub package: String,
     pub unique_id: String,
     pub relation: Relation,
     pub ephemeral: bool,
@@ -110,14 +114,15 @@ pub struct Shared {
     pub database_name: String,
     pub vars: Map<String, Json>,
     pub db: Option<Arc<dyn Database>>,
-    pub names: RwLock<BTreeMap<String, RefTarget>>,
+    /// Every model, seed and snapshot, by package and name.
+    pub names: RwLock<BTreeMap<(String, String), RefTarget>>,
     pub sources: BTreeMap<(String, String), SourceTable>,
     /// `dispatch:` search orders, by macro namespace.
     pub dispatch: BTreeMap<String, Vec<String>>,
     /// The installed packages' names.
     pub packages: BTreeSet<String>,
-    /// `{% docs %}` blocks, for `doc()`.
-    pub docs: BTreeMap<String, String>,
+    /// `{% docs %}` blocks, for `doc()`: by package, then name.
+    pub docs: BTreeMap<String, BTreeMap<String, String>>,
     pub flags: Mutex<InvocationFlags>,
     pub current: Mutex<Current>,
 }
@@ -168,6 +173,49 @@ impl Shared {
         };
     }
 
+    /// The package of the node being rendered: the second part of its
+    /// unique id (`model.<package>.<name>`), or the root project when no
+    /// node is (hooks, operations).
+    pub fn current_package(&self) -> String {
+        let cur = self.current.lock().unwrap();
+        cur.node
+            .split('.')
+            .nth(1)
+            .map_or_else(|| self.project_name.clone(), str::to_owned)
+    }
+
+    /// What `ref()` names, as dbt resolves it: in `package` when one is
+    /// given; otherwise in the root project, then in the package of the
+    /// node that refs it, then in the one other package that has it.
+    pub fn resolve_ref(
+        &self,
+        package: Option<&str>,
+        name: &str,
+        from: &str,
+    ) -> Result<RefTarget, String> {
+        let names = self.names.read().unwrap();
+        let get = |pkg: &str| names.get(&(pkg.to_owned(), name.to_owned())).cloned();
+        if let Some(package) = package {
+            return get(package).ok_or_else(|| {
+                format!("there is no model, seed or snapshot {name:?} in package {package:?}")
+            });
+        }
+        if let Some(t) = get(&self.project_name).or_else(|| get(from)) {
+            return Ok(t);
+        }
+        let mut others = names.iter().filter(|((_, n), _)| n == name).map(|(_, t)| t);
+        match (others.next(), others.next()) {
+            (Some(t), None) => Ok(t.clone()),
+            (None, _) => Err(format!(
+                "{name:?} is not a model, seed or snapshot in this project or its packages"
+            )),
+            (Some(a), Some(b)) => Err(format!(
+                "{name:?} is defined in packages {} and {}; name one: ref('<package>', {name:?})",
+                a.package, b.package
+            )),
+        }
+    }
+
     /// Ends a render, returning what it recorded.
     pub fn finish(&self) -> Current {
         std::mem::take(&mut *self.current.lock().unwrap())
@@ -182,7 +230,21 @@ pub fn environment(
 ) -> Result<Environment<'static>, crate::Error> {
     let mut env = Environment::new();
     env.set_fuel(Some(FUEL));
-    let files = Arc::new(project.files.clone());
+    // A package's models, tests and analyses run in the package, so the
+    // macros they call resolve there first.
+    let mut files = project.files.clone();
+    for package in project.packages.values() {
+        let prefix = format!("{}/", package.dir);
+        for (path, text) in files.range_mut(prefix.clone()..) {
+            if !path.starts_with(&prefix) {
+                break;
+            }
+            if path.ends_with(".sql") {
+                *text = packages::in_package(&package.name, text);
+            }
+        }
+    }
+    let files = Arc::new(files);
     env.set_loader(move |name| Ok(files.get(name).cloned()));
 
     // The fork resolves an unknown name `m` as the template `<pkg>.m`:
@@ -209,11 +271,11 @@ pub fn environment(
             false,
         )?;
     }
-    for path in &project.macro_files {
+    for path in &project.root.macro_files {
         registry.add_file(&mut env, &pkg, path, &project.files[path], false)?;
     }
     for package in project.packages.values() {
-        for path in &package.macro_files {
+        for path in &package.resources.macro_files {
             registry.add_file(&mut env, &package.name, path, &project.files[path], true)?;
         }
     }

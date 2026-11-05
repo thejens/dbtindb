@@ -71,6 +71,32 @@ class PackageTest(unittest.TestCase):
         (step,) = call(conn, "dbtindb_test")["steps"]
         self.assertEqual((step["status"], step["failures"]), ("fail", 3))
 
+    def test_package_models_seeds_and_unit_tests(self):
+        conn = connect()
+        put(conn, {
+            "dbt_packages/audit/dbt_project.yml": "name: audit\nmodels:\n  audit:\n    +materialized: table\n",
+            "dbt_packages/audit/seeds/kinds.csv": "id,kind\n1,a\n2,b\n",
+            "dbt_packages/audit/models/events.sql":
+                "select id, kind, {{ tag() }} as tag from {{ ref('kinds') }}",
+            "dbt_packages/audit/models/s.yml":
+                "models:\n  - name: events\n    columns: [{name: id, data_tests: [unique]}]\n",
+            "dbt_packages/audit/macros/tag.sql": "{% macro tag() %}'audit'{% endmacro %}",
+            "models/report.sql": "select count(*) as n, max(tag) as tag from {{ ref('audit', 'events') }}",
+            "tests/fixtures/events.csv": "id,kind,tag\n1,a,x\n2,b,y\n3,c,z\n",
+            "models/unit.yml": "unit_tests:\n  - name: counts\n    model: report\n"
+                               "    given: [{input: \"ref('audit', 'events')\", format: csv, fixture: events}]\n"
+                               "    expect: {rows: [{n: 3, tag: z}]}\n",
+        })
+        result = call(conn, "dbtindb_build")
+        self.assertEqual(
+            {s["name"]: s["status"] for s in result["steps"]},
+            {"kinds": "success", "events": "success", "unique_events_id": "pass",
+             "report": "success", "counts": "pass"},
+        )
+        self.assertEqual(conn.execute("SELECT n, tag FROM report").fetchone(), (2, "audit"))
+        kind = conn.execute("SELECT type FROM sqlite_master WHERE name = 'events'").fetchone()
+        self.assertEqual(kind, ("table",))
+
 
 class CrossDatabaseMacroTest(unittest.TestCase):
     def test_dates_follow_postgres(self):

@@ -125,7 +125,7 @@ A project is the set of rows in `dbtindb_files`, one per file, keyed by its path
 | `snapshots/**/*.sql` | `{% snapshot %}` blocks. Snapshots can also be declared in YAML with `relation:`. |
 | `analyses/**/<name>.sql` | An analysis: compiled with `dbtindb_compile`, never run. |
 | `**/*.md` | `{% docs %}` blocks, which descriptions use through `{{ doc('name') }}`. They are read from every resource path, or from `docs-paths`. |
-| `tests/**/*.sql` | Singular tests. `tests/generic/*.sql` holds `{% test %}` blocks. |
+| `tests/**/*.sql` | Singular tests. `tests/generic/*.sql` holds `{% test %}` blocks, and `tests/fixtures/**/*.csv` or `.sql` the rows of unit tests' `fixture:` inputs. |
 | `macros/**/*.sql` | Macros and `{% test %}` blocks. Every file can call them without an import. |
 | `dbt_packages/<package>/**` | An installed package, as `dbt deps` leaves it. See [Packages](#packages). |
 
@@ -158,7 +158,7 @@ You can also write the rows yourself: a path is a file's path relative to the pr
 
 ### Packages
 
-Packages installed by `dbt deps` are read from `dbt_packages/` (or `packages-install-path`), each with its own `dbt_project.yml`. dbtindb uses their macros and generic tests, which is what utility packages such as [dbt_utils](https://github.com/dbt-labs/dbt-utils), dbt_date, dbt_expectations and codegen consist of. A package that defines models, seeds or snapshots is an error.
+Packages installed by `dbt deps` are read from `dbt_packages/` (or `packages-install-path`), each with its own `dbt_project.yml`. Everything a package defines is used, as in dbt: the macros and generic tests of utility packages such as [dbt_utils](https://github.com/dbt-labs/dbt-utils), dbt_date, dbt_expectations and codegen, and the models, seeds, snapshots, tests, analyses, docs blocks, sources and hooks of modelling packages.
 
 Macros resolve as in dbt:
 
@@ -166,6 +166,10 @@ Macros resolve as in dbt:
 - Inside a package, a bare macro name means the package's own macro first, then the project's, then dbt's.
 - `adapter.dispatch('star', 'dbt_utils')` searches your project before the package, so a `postgres__star` or `default__star` of yours overrides the package's. A `dispatch:` entry in `dbt_project.yml` sets another search order.
 - Vars scoped to a package (`vars: {dbt_utils: {...}}`) apply, and a package's own `vars` are defaults.
+- A package's nodes are namespaced by it: `model.<package>.<name>`, with `<package>` first in their `fqn`, so `package:<name>` selects them. `ref('<package>', '<name>')` names one; a bare `ref('<name>')` means the root project's node, then the one in the package doing the ref, then the only package that has it.
+- A package's own `models:`/`seeds:`/`snapshots:`/`data_tests:` config applies to its nodes, and your `dbt_project.yml` can override it under the package's name (`models: {audit: {+schema: audit}}`).
+- Their relations are named by your `generate_schema_name`/`generate_alias_name`, else the package's own, else dbt's. Two nodes that would build the same relation are an error, as in dbt.
+- The packages' `on-run-start`/`on-run-end` hooks run before yours, in package name order.
 
 dbt's own cross-database macros are built in, as the `dbt` package: `dbt.dateadd`, `dbt.datediff`, `dbt.date_trunc`, `dbt.last_day`, `dbt.split_part`, `dbt.listagg`, `dbt.hash`, `dbt.concat`, `dbt.safe_cast`, `dbt.type_string` and the other `type_*` macros, `dbt.current_timestamp`, `dbt.date_spine`, `dbt.generate_series`, `statement` and `get_columns_in_query`. On PostgreSQL they are dbt-postgres's own. On SQLite, dbtindb implements them on SQLite's date functions:
 
@@ -280,7 +284,7 @@ SQLite only checks a view's columns when the view is queried, so a view model th
 | **Snapshots** | `{% snapshot %}` blocks and dbt 1.9's YAML snapshots (`relation: ref(...)` or `source(...)`). `strategy='timestamp'` (`updated_at`) and `strategy='check'` (`check_cols`, or `'all'`), `unique_key`, and `hard_deletes` `ignore`, `invalidate` (or `invalidate_hard_deletes`) and `new_record`, which adds a version with `dbt_is_deleted = 'True'`. dbt's `dbt_scd_id`, `dbt_updated_at`, `dbt_valid_from` and `dbt_valid_to` columns. Snapshots go to `target_schema`, or the schema their config gives. |
 | **Seeds** | Type inference, `column_types`, `delimiter`. A reload keeps the table when its columns are unchanged. |
 | **Tests** | `unique`, `not_null`, `accepted_values` (`quote`), `relationships`, custom generic tests (`{% test %}`, with or without `arguments:`), package tests (`dbt_utils.expression_is_true`), singular tests, and `severity`, `warn_if`, `error_if`, `fail_calc`, `limit`, `where` and `enabled` configs. Tests on sources work too. `store_failures` (or `store_failures_as: table` or `view`) keeps the failing rows in `<target schema>_dbt_test__audit.<test name>` (on SQLite, in `main`). The rows of a failing `dbtindb_test` stay; a failing build rolls them back with everything else. |
-| **Unit tests** | dbt 1.8 `unit_tests:` with `given` inputs (`ref`, `source`, and `this` for incremental models) in the `dict`, `csv` and `sql` formats, `expect`, and `overrides` of `vars`, `env_vars` and the `is_incremental` macro. Fixture rows are cast to the column types of the inputs, so those must exist in the database (`dbtindb_build` builds them first), unless the rows are given as `sql`. Rows are compared as multisets over the columns `expect` names, and the differing rows are logged. |
+| **Unit tests** | dbt 1.8 `unit_tests:` with `given` inputs (`ref`, `source`, and `this` for incremental models) in the `dict`, `csv` and `sql` formats, `expect`, rows given inline or as a `fixture:` file (`<test path>/fixtures/**/<name>.csv` or `.sql`), and `overrides` of `vars`, `env_vars` and macros (`is_incremental`, or any macro by name or as `package.macro`, which then returns the given value when the model calls it). Fixture rows are cast to the column types of the inputs, so those must exist in the database (`dbtindb_build` builds them first), unless the rows are given as `sql`. Rows are compared as multisets over the columns `expect` names, and the differing rows are logged. |
 | **Docs** | `{% docs %}` blocks and `doc()` in descriptions, and `persist_docs` as comments on PostgreSQL. |
 | **Analyses** | Compiled with `ref`, `source` and macros, never run. |
 | **Grants** | `grants` on PostgreSQL: after a build, the privileges others hold on the relation are made equal to the config, merged as dbt does (`+select` adds grantees). SQLite has no roles and ignores them. |
@@ -288,7 +292,7 @@ SQLite only checks a view's columns when the view is queried, so a view model th
 | **Hooks** | `pre_hook` and `post_hook` per node, `on-run-start` and `on-run-end` per project. Hooks can use `run_query`, `this` and `target`. |
 | **Jinja context** | `ref` (one argument, or two naming this project), `source`, `doc`, `config`, `var`, `env_var`, `this`, `target`, `execute`, `model`, `project_name`, `is_incremental`, `run_query` (agate-like rows and columns), `statement` blocks with `load_result`/`store_result`, `load_relation`, `log`, `print`, `exceptions` (`raise_compiler_error`, `warn`), `adapter` (`dispatch`, `quote`, `execute`, `get_relation`, `load_relation`, `get_columns_in_relation`, `type`), `api.Column` and `api.Relation`, `modules` (`datetime`, `re`, `pytz`), `flags`, `run_started_at`, `invocation_id`, `dbt_version`, `fromjson`, `tojson`, `fromyaml`, `toyaml`, `zip`, `set`, `try_or_compiler_error` and `local_md5`, and Python's string, list and dict methods. Relations and columns are dbt-like objects (`relation.identifier`, `column.quoted`, `column.is_string()`). |
 | **Macros** | Global, as in dbt, and they can override `generate_schema_name` and `generate_alias_name`. Packages and dbt's cross-database macros as described in [Packages](#packages), with dbt's `adapter.dispatch` search order and `dispatch:` config. |
-| **Not supported** | Package models, seeds and snapshots, cross-project or versioned `ref`, `database` configs, Python models, unit test fixture files and overrides of macros other than `is_incremental`, exposures, metrics, semantic models, `dbt source freshness` and `dbt docs`. Each is an error or ignored, never a silently different build. |
+| **Not supported** | Cross-project or versioned `ref`, `database` configs, Python models, exposures, metrics, semantic models, `dbt source freshness` and `dbt docs`. Each is an error or ignored, never a silently different build. |
 
 ## How a command runs
 
@@ -312,7 +316,7 @@ No. dbtindb uses dbt's Jinja engine and follows dbt's project layout, configs, c
 
 ### Why not just run dbt?
 
-You should if you already run dbt, or if you need a warehouse, packages that define models, or the wider dbt ecosystem. dbtindb is for cases where an external process is the problem: projects that ship inside an application database or a SQLite file, builds triggered from SQL or `pg_cron`, and environments where you only have a SQL connection.
+You should if you already run dbt, or if you need a warehouse or the wider dbt ecosystem. dbtindb is for cases where an external process is the problem: projects that ship inside an application database or a SQLite file, builds triggered from SQL or `pg_cron`, and environments where you only have a SQL connection.
 
 ### Can I use it on Amazon RDS, Cloud SQL, Supabase or Neon?
 

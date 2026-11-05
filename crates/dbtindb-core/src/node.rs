@@ -99,6 +99,8 @@ pub struct Node {
     pub unique_id: String,
     pub resource_type: ResourceType,
     pub name: String,
+    /// The project or package that defines it.
+    pub package: String,
     /// The file that defines it: the template, or for generic tests the
     /// property file that applies them.
     pub path: String,
@@ -157,12 +159,12 @@ impl Node {
 
     /// The node as Jinja sees it in `model` and in `generate_schema_name`'s
     /// `node` argument.
-    pub fn to_json(&self, project: &str) -> Map<String, Value> {
+    pub fn to_json(&self) -> Map<String, Value> {
         let mut m = Map::new();
         m.insert("name".into(), self.name.clone().into());
         m.insert("unique_id".into(), self.unique_id.clone().into());
         m.insert("resource_type".into(), self.resource_type.as_str().into());
-        m.insert("package_name".into(), project.into());
+        m.insert("package_name".into(), self.package.clone().into());
         m.insert("path".into(), self.path.clone().into());
         m.insert("original_file_path".into(), self.path.clone().into());
         m.insert("fqn".into(), self.fqn.clone().into());
@@ -184,11 +186,4 @@ pub struct Manifest {
     pub nodes: BTreeMap<String, Node>,
     pub on_run_start: Vec<String>,
     pub on_run_end: Vec<String>,
-}
-
-impl Manifest {
-    /// The unique id of the model, seed or snapshot called `name`.
-    pub fn find(&self, name: &str) -> Option<&Node> {
-        self.nodes.values().find(|n| !n.is_test() && n.name == name)
-    }
 }

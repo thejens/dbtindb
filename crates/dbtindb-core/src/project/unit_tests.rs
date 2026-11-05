@@ -1,10 +1,16 @@
 //! dbt 1.8 unit tests, from `unit_tests:` in property files: a model run
 //! on fixed input rows, its output compared with the expected rows.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
 use super::properties::{list, optional_string, string};
 use crate::Error;
+
+/// Fixture files, `<test-path>/fixtures/**/<name>.csv` or `.sql`, by name
+/// and extension: their text.
+pub type FixtureFiles = BTreeMap<(String, String), String>;
 
 /// Fixture rows, in one of dbt's three formats.
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +44,9 @@ pub struct UnitTestDef {
     pub expect: Rows,
     /// `overrides: {macros: {is_incremental: true}}`.
     pub is_incremental: bool,
+    /// The other `overrides: {macros: ...}`: what each named macro (bare,
+    /// or `package.macro`) returns instead of running.
+    pub macros: Map<String, Value>,
     /// `overrides: {vars: ...}`, layered over the project's vars.
     pub vars: Map<String, Value>,
     /// `overrides: {env_vars: ...}`, what `env_var()` returns.
@@ -45,8 +54,9 @@ pub struct UnitTestDef {
     pub config: Map<String, Value>,
 }
 
-/// Reads one entry of `unit_tests:`.
-pub fn parse(path: &str, entry: &Value) -> Result<UnitTestDef, Error> {
+/// Reads one entry of `unit_tests:`, with the fixture files its rows can
+/// name.
+pub fn parse(path: &str, entry: &Value, fixtures: &FixtureFiles) -> Result<UnitTestDef, Error> {
     let name = string(entry, "name", &format!("{path}: unit_tests"))?;
     let where_ = format!("{path}: unit test {name:?}");
     let err = |what: &str| Error::new(format!("{where_}: {what}"));
@@ -59,7 +69,7 @@ pub fn parse(path: &str, entry: &Value) -> Result<UnitTestDef, Error> {
         .map(|g| {
             Ok(Given {
                 input: string(g, "input", &where_)?.trim().to_owned(),
-                rows: rows(g, &where_)?,
+                rows: rows(g, &where_, fixtures)?,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -70,8 +80,9 @@ pub fn parse(path: &str, entry: &Value) -> Result<UnitTestDef, Error> {
         file: path.to_owned(),
         description: optional_string(entry, "description")?.unwrap_or_default(),
         given,
-        expect: rows(expect, &where_)?,
+        expect: rows(expect, &where_, fixtures)?,
         is_incremental: false,
+        macros: Map::new(),
         vars: Map::new(),
         env_vars: Map::new(),
         config: mapping(entry.get("config"), "config", &where_)?,
@@ -85,17 +96,28 @@ pub fn parse(path: &str, entry: &Value) -> Result<UnitTestDef, Error> {
             "env_vars" => def.env_vars = mapping(Some(value), "overrides.env_vars", &where_)?,
             "macros" => {
                 for (m, v) in mapping(Some(value), "overrides.macros", &where_)? {
-                    match (m.as_str(), v) {
-                        ("is_incremental", Value::Bool(b)) => def.is_incremental = b,
+                    match (m.as_str(), &v) {
+                        ("is_incremental", Value::Bool(b)) => def.is_incremental = *b,
                         ("is_incremental", _) => {
                             return Err(err(
                                 "overrides.macros.is_incremental must be true or false",
                             ));
                         }
                         _ => {
-                            return Err(err(&format!(
-                                "overriding macro {m:?} is not supported; only is_incremental is"
-                            )));
+                            let valid = m.split('.').count() <= 2
+                                && m.split('.').all(|part| {
+                                    !part.is_empty()
+                                        && part
+                                            .chars()
+                                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                });
+                            if !valid {
+                                return Err(err(&format!(
+                                    "overrides.macros: {m:?} is not a macro name \
+                                     (`name` or `package.name`)"
+                                )));
+                            }
+                            def.macros.insert(m, v);
                         }
                     }
                 }
@@ -106,15 +128,34 @@ pub fn parse(path: &str, entry: &Value) -> Result<UnitTestDef, Error> {
     Ok(def)
 }
 
-fn rows(entry: &Value, where_: &str) -> Result<Rows, Error> {
+fn rows(entry: &Value, where_: &str, fixtures: &FixtureFiles) -> Result<Rows, Error> {
     let err = |what: String| Error::new(format!("{where_}: {what}"));
-    if entry.get("fixture").is_some() {
-        return Err(err(
-            "fixture files are not supported; give the rows inline".into()
-        ));
-    }
     let format = optional_string(entry, "format")?.unwrap_or_else(|| "dict".into());
-    let rows = entry.get("rows");
+    // `fixture: name` reads the rows from `fixtures/name.csv` (or `.sql`)
+    // under a test path, in place of inline `rows`.
+    let file;
+    let rows = match optional_string(entry, "fixture")? {
+        Some(_) if entry.get("rows").is_some() => {
+            return Err(err("give either rows or a fixture, not both".into()));
+        }
+        Some(name) => {
+            if format == "dict" {
+                return Err(err(format!(
+                    "fixture {name:?}: fixture files are csv or sql; set format: csv or format: sql"
+                )));
+            }
+            let text = fixtures
+                .get(&(name.clone(), format.clone()))
+                .ok_or_else(|| {
+                    err(format!(
+                        "there is no fixture file {name}.{format} in a fixtures directory of the test paths"
+                    ))
+                })?;
+            file = Value::String(text.clone());
+            Some(&file)
+        }
+        None => entry.get("rows"),
+    };
     match format.as_str() {
         "dict" => list(rows, where_)?
             .into_iter()
@@ -173,6 +214,7 @@ mod tests {
                 "expect": {"rows": [{"id": 1}]},
                 "overrides": {"macros": {"is_incremental": true}, "vars": {"x": 1}},
             }),
+            &FixtureFiles::new(),
         )
         .unwrap();
         assert_eq!(def.given[1].rows, Rows::Csv("id\n1\n".into()));
@@ -180,12 +222,60 @@ mod tests {
         assert!(def.is_incremental);
         assert_eq!(def.vars["x"], json!(1));
 
+        let def = parse(
+            "u.yml",
+            &json!({"name": "t", "model": "m", "expect": {"rows": []},
+                    "overrides": {"macros": {"dbt_utils.now": "'2024-01-01'"}}}),
+            &FixtureFiles::new(),
+        )
+        .unwrap();
+        assert_eq!(def.macros["dbt_utils.now"], json!("'2024-01-01'"));
         let err = parse(
             "u.yml",
             &json!({"name": "t", "model": "m", "expect": {"rows": []},
-                    "overrides": {"macros": {"current_timestamp": "x"}}}),
+                    "overrides": {"macros": {"a.b.c": "x"}}}),
+            &FixtureFiles::new(),
         )
         .unwrap_err();
-        assert!(err.0.contains("only is_incremental"), "{err}");
+        assert!(err.0.contains("is not a macro name"), "{err}");
+    }
+
+    #[test]
+    fn reads_fixture_files() {
+        let fixtures = FixtureFiles::from([(
+            ("orders".to_owned(), "csv".to_owned()),
+            "id\n1\n".to_owned(),
+        )]);
+        let def = parse(
+            "models/u.yml",
+            &json!({
+                "name": "t", "model": "m",
+                "given": [{"input": "ref('a')", "format": "csv", "fixture": "orders"}],
+                "expect": {"format": "csv", "fixture": "orders"},
+            }),
+            &fixtures,
+        )
+        .unwrap();
+        assert_eq!(def.given[0].rows, Rows::Csv("id\n1\n".into()));
+        assert_eq!(def.expect, Rows::Csv("id\n1\n".into()));
+        for (entry, msg) in [
+            (json!({"fixture": "orders"}), "set format: csv"),
+            (
+                json!({"format": "sql", "fixture": "orders"}),
+                "no fixture file orders.sql",
+            ),
+            (
+                json!({"format": "csv", "fixture": "orders", "rows": "id"}),
+                "not both",
+            ),
+        ] {
+            let err = parse(
+                "u.yml",
+                &json!({"name": "t", "model": "m", "expect": entry}),
+                &fixtures,
+            )
+            .unwrap_err();
+            assert!(err.0.contains(msg), "{err}");
+        }
     }
 }

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::unit_tests::{self, UnitTestDef};
+use super::unit_tests::{self, FixtureFiles, UnitTestDef};
 use crate::{Error, yaml};
 
 /// Everything the project's property files declare, merged.
@@ -69,8 +69,14 @@ pub struct SourceTable {
 }
 
 impl Properties {
-    /// Adds the declarations of one property file.
-    pub fn add_file(&mut self, path: &str, text: &str) -> Result<(), Error> {
+    /// Adds the declarations of one property file, whose unit tests can
+    /// read `fixtures`.
+    pub fn add_file(
+        &mut self,
+        path: &str,
+        text: &str,
+        fixtures: &FixtureFiles,
+    ) -> Result<(), Error> {
         let doc = yaml::parse(path, text)?;
         let doc = doc.as_object().expect("yaml::parse returns a mapping");
         let ctx = |what: &str| format!("{path}: {what}");
@@ -124,7 +130,7 @@ impl Properties {
             }
         }
         for entry in list(doc.get("unit_tests"), &ctx("unit_tests"))? {
-            let def = unit_tests::parse(path, entry)?;
+            let def = unit_tests::parse(path, entry, fixtures)?;
             if let Some(prev) = self
                 .unit_tests
                 .iter()
@@ -289,6 +295,7 @@ sources:
       - name: orders
         identifier: orders_v2
 "#,
+            &FixtureFiles::new(),
         )
         .unwrap();
         let c = &p.models["customers"];
@@ -314,6 +321,7 @@ sources:
         p.add_file(
             "models/s.yml",
             "models:\n  - name: m\n    tests: [dbt_utils.at_least_one, dbt.not_null]\n",
+            &FixtureFiles::new(),
         )
         .unwrap();
         let tests: Vec<_> = p.models["m"]

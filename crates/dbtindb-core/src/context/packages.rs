@@ -43,10 +43,8 @@ impl Registry {
         source: &str,
         scoped: bool,
     ) -> Result<(), crate::Error> {
-        // On the first line and without a newline, so error line numbers
-        // still match the file.
         let source = if scoped {
-            format!("{{% set {TARGET_PACKAGE_NAME} = {package:?} %}}{source}")
+            in_package(package, source)
         } else {
             source.to_owned()
         };
@@ -88,6 +86,14 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+/// A template's source, set to run in `package`: unqualified macro names
+/// in it resolve in that package first.
+pub fn in_package(package: &str, source: &str) -> String {
+    // On the first line and without a newline, so error line numbers
+    // still match the file.
+    format!("{{% set {TARGET_PACKAGE_NAME} = {package:?} %}}{source}")
 }
 
 /// A package by name: its macros are its attributes.
