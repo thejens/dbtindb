@@ -158,6 +158,26 @@ fn renders_dbt_cross_database_macros() {
         .compile_inline("{{ dbt.array_construct([1]) }}")
         .unwrap_err();
     assert!(err.0.contains("no array type"), "{err}");
+
+    let duck = session(&[], Dialect::DuckDB);
+    assert_eq!(inline(&duck, "{{ dbt.type_string() }}"), "VARCHAR");
+    assert_eq!(inline(&duck, "{{ dbt.type_float() }}"), "DOUBLE");
+    assert_eq!(
+        inline(&duck, "{{ dbt.datediff('a', 'b', 'day') }}"),
+        "date_diff('day', (a)::timestamp, (b)::timestamp)"
+    );
+    assert_eq!(
+        inline(&duck, "{{ dbt.date(2024, 2, 9) }}"),
+        "make_date(2024, 2, 9)"
+    );
+    assert_eq!(inline(&duck, "{{ dbt.current_timestamp() }}"), "now()");
+    assert_eq!(
+        inline(
+            &duck,
+            "{{ api.Relation.create(schema='s', identifier='t') }}"
+        ),
+        "\"s\".\"t\""
+    );
 }
 
 #[test]

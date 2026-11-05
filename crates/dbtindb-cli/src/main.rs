@@ -1,8 +1,8 @@
 //! `dbtindb`: the command line companion of the dbtindb extensions.
 //!
-//! It talks to no database itself. It writes SQL for `psql` or `sqlite3`,
-//! so connections, credentials and extension loading stay with the
-//! clients people already use.
+//! It talks to no database itself. It writes SQL for `psql`, `sqlite3` or
+//! `duckdb`, so connections, credentials and extension loading stay with
+//! the clients people already use.
 
 mod project;
 mod script;
@@ -19,7 +19,7 @@ use crate::script::{Dialect, Mode};
 #[command(
     name = "dbtindb",
     version,
-    about = "Run dbt projects inside PostgreSQL and SQLite"
+    about = "Run dbt projects inside PostgreSQL, SQLite and DuckDB"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,10 +29,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Print SQL that loads a dbt project into the database's dbtindb_files
-    /// table, for piping into psql or sqlite3.
+    /// table, for piping into psql, sqlite3 or duckdb.
     ///
     ///   dbtindb load ./jaffle_shop --dialect postgres | psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
     ///   dbtindb load ./jaffle_shop --dialect sqlite | sqlite3 app.db
+    ///   dbtindb load ./jaffle_shop --dialect duckdb | duckdb app.duckdb
     #[command(verbatim_doc_comment)]
     Load {
         /// The project directory, holding dbt_project.yml.

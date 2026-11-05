@@ -5,6 +5,7 @@
 pub enum Dialect {
     Postgres,
     Sqlite,
+    DuckDB,
 }
 
 impl Dialect {
@@ -13,16 +14,26 @@ impl Dialect {
         match self {
             Dialect::Postgres => "postgres",
             Dialect::Sqlite => "sqlite",
+            Dialect::DuckDB => "duckdb",
         }
     }
 
-    /// Quotes an identifier. Both dialects use standard double quotes, with
+    /// The database's name for people, in error messages.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Dialect::Postgres => "PostgreSQL",
+            Dialect::Sqlite => "SQLite",
+            Dialect::DuckDB => "DuckDB",
+        }
+    }
+
+    /// Quotes an identifier. All dialects use standard double quotes, with
     /// embedded quotes doubled.
     pub fn quote(self, ident: &str) -> String {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
 
-    /// A string literal. Both dialects follow the standard: only `'` is
+    /// A string literal. All dialects follow the standard: only `'` is
     /// special (PostgreSQL has standard_conforming_strings on by default
     /// since 9.1, and dbtindb's own statements never rely on it being off).
     pub fn literal(self, s: &str) -> String {
@@ -32,7 +43,9 @@ impl Dialect {
     /// The reference to a relation as it appears in compiled SQL.
     pub fn relation(self, schema: &str, name: &str) -> String {
         match self {
-            Dialect::Postgres => format!("{}.{}", self.quote(schema), self.quote(name)),
+            Dialect::Postgres | Dialect::DuckDB => {
+                format!("{}.{}", self.quote(schema), self.quote(name))
+            }
             // A SQLite view may only reference objects in its own schema, so
             // qualifying with a schema name would break views over models.
             Dialect::Sqlite => self.quote(name),
@@ -41,14 +54,14 @@ impl Dialect {
 
     /// Whether models can be built in more than one schema.
     pub fn has_schemas(self) -> bool {
-        self == Dialect::Postgres
+        self != Dialect::Sqlite
     }
 
     /// The longest identifier the database keeps without truncating it.
     pub fn max_identifier_bytes(self) -> Option<usize> {
         match self {
             Dialect::Postgres => Some(63),
-            Dialect::Sqlite => None,
+            Dialect::Sqlite | Dialect::DuckDB => None,
         }
     }
 
@@ -61,7 +74,9 @@ impl Dialect {
     pub fn temp_schema(self) -> &'static str {
         match self {
             Dialect::Postgres => "pg_temp",
-            Dialect::Sqlite => "temp",
+            // DuckDB keeps temporary tables in the `temp` catalog; its
+            // Database implementation maps this name to that catalog.
+            Dialect::Sqlite | Dialect::DuckDB => "temp",
         }
     }
 
@@ -70,6 +85,9 @@ impl Dialect {
         match self {
             Dialect::Postgres => "now()",
             Dialect::Sqlite => "strftime('%Y-%m-%d %H:%M:%f', 'now')",
+            // A plain TIMESTAMP, like dbt-duckdb's snapshot timestamps;
+            // now() is a TIMESTAMP WITH TIME ZONE.
+            Dialect::DuckDB => "now()::timestamp",
         }
     }
 
@@ -78,7 +96,7 @@ impl Dialect {
     /// `dbtindb_md5` because SQLite has no hash function of its own.
     pub fn md5(self, expr: &str) -> String {
         match self {
-            Dialect::Postgres => format!("md5({expr})"),
+            Dialect::Postgres | Dialect::DuckDB => format!("md5({expr})"),
             Dialect::Sqlite => format!("dbtindb_md5({expr})"),
         }
     }
@@ -86,8 +104,9 @@ impl Dialect {
     /// `expr` as text, with NULL as the empty string, for hashing.
     pub fn text_or_empty(self, expr: &str) -> String {
         match self {
-            Dialect::Postgres => format!("coalesce(cast({expr} as text), '')"),
-            Dialect::Sqlite => format!("coalesce(cast({expr} as text), '')"),
+            Dialect::Postgres | Dialect::Sqlite | Dialect::DuckDB => {
+                format!("coalesce(cast({expr} as text), '')")
+            }
         }
     }
 
@@ -95,7 +114,7 @@ impl Dialect {
     /// NULLs as equal.
     pub fn is_distinct(self, a: &str, b: &str) -> String {
         match self {
-            Dialect::Postgres => format!("{a} IS DISTINCT FROM {b}"),
+            Dialect::Postgres | Dialect::DuckDB => format!("{a} IS DISTINCT FROM {b}"),
             Dialect::Sqlite => format!("{a} IS NOT {b}"),
         }
     }
@@ -112,6 +131,14 @@ impl Dialect {
             (Dialect::Sqlite, SeedType::Integer | SeedType::Boolean) => "INTEGER",
             (Dialect::Sqlite, SeedType::Number) => "REAL",
             (Dialect::Sqlite, SeedType::Date | SeedType::Timestamp | SeedType::Text) => "TEXT",
+            (Dialect::DuckDB, SeedType::Integer) => "BIGINT",
+            // DuckDB's NUMERIC without precision is DECIMAL(18,3), which
+            // would round seed values; DOUBLE is what dbt-duckdb infers.
+            (Dialect::DuckDB, SeedType::Number) => "DOUBLE",
+            (Dialect::DuckDB, SeedType::Boolean) => "BOOLEAN",
+            (Dialect::DuckDB, SeedType::Date) => "DATE",
+            (Dialect::DuckDB, SeedType::Timestamp) => "TIMESTAMP",
+            (Dialect::DuckDB, SeedType::Text) => "VARCHAR",
         }
     }
 }

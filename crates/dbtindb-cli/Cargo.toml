@@ -1,6 +1,6 @@
 [package]
 name = "dbtindb-cli"
-description = "The dbtindb command line: turns a dbt project directory into SQL that loads it into PostgreSQL or SQLite."
+description = "The dbtindb command line: turns a dbt project directory into SQL that loads it into PostgreSQL, SQLite or DuckDB."
 edition = "2024"
 version.workspace = true
 license.workspace = true

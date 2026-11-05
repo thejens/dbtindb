@@ -63,6 +63,9 @@ pub const POSTGRES: &[(&str, &str)] = files![
 /// dbtindb's `sqlite__` versions.
 pub const SQLITE: &[(&str, &str)] = files!["sqlite/utils.sql",];
 
+/// dbtindb's `duckdb__` versions.
+pub const DUCKDB: &[(&str, &str)] = files!["duckdb/utils.sql",];
+
 /// The files for one dialect.
 pub fn files(
     dialect: crate::Dialect,
@@ -70,6 +73,7 @@ pub fn files(
     let own = match dialect {
         crate::Dialect::Postgres => POSTGRES,
         crate::Dialect::Sqlite => SQLITE,
+        crate::Dialect::DuckDB => DUCKDB,
     };
     COMMON.iter().chain(own)
 }

@@ -109,3 +109,43 @@ jobs:
         run: |
           "$PYTHON" -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
           "$PYTHON" -m unittest discover -s crates/sqlite_dbtindb/tests -v
+
+  duckdb:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "DuckDB 2.0 (Linux)", os: ubuntu-24.04, platform: linux_amd64, lib: libduckdb_dbtindb.so, duckdb: "duckdb==2.0.0" }
+          # The oldest DuckDB line providing the C API version the extension asks for.
+          - { name: "DuckDB 1.5 (Linux)", os: ubuntu-24.04, platform: linux_amd64, lib: libduckdb_dbtindb.so, duckdb: "duckdb>=1.5,<1.6" }
+          - { name: "DuckDB 2.0 (macOS)", os: macos-15, platform: osx_arm64, lib: libduckdb_dbtindb.dylib, duckdb: "duckdb==2.0.0" }
+          - { name: "DuckDB 2.0 (Windows)", os: windows-2025, platform: windows_amd64, lib: duckdb_dbtindb.dll, duckdb: "duckdb==2.0.0" }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy -p duckdb_dbtindb --all-targets -- -D warnings
+
+      - name: Build DuckDB extension and CLI
+        run: cargo build --release -p duckdb_dbtindb -p dbtindb-cli
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Package
+        run: python crates/duckdb_dbtindb/package.py target/release/${{ matrix.lib }} --platform ${{ matrix.platform }}
+
+      - name: End-to-end tests (extension loaded into DuckDB, CLI)
+        run: |
+          python -m pip install "${{ matrix.duckdb }}"
+          python -c "import duckdb; print('DuckDB', duckdb.__version__)"
+          python -m unittest discover -s crates/duckdb_dbtindb/tests -v

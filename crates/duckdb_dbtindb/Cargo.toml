@@ -1,0 +1,20 @@
+[package]
+name = "duckdb_dbtindb"
+description = "dbtindb for DuckDB: a loadable extension that builds, tests and snapshots a dbt project inside the database."
+edition = "2024"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# Packaged by package.py into dbtindb.duckdb_extension; DuckDB derives the
+# entry point dbtindb_init_c_api from that file name.
+crate-type = ["cdylib"]
+
+[dependencies]
+dbtindb-core = { path = "../dbtindb-core" }
+# DuckDB's stable C extension API, through the function table DuckDB hands
+# the extension; used directly because the `duckdb` crate always builds
+# Arrow.
+libduckdb-sys = { version = "=1.20000.1", default-features = false, features = ["loadable-extension"] }
+serde_json.workspace = true

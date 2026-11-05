@@ -6,6 +6,8 @@ use crate::project::File;
 pub enum Dialect {
     Postgres,
     Sqlite,
+    #[value(name = "duckdb")]
+    DuckDB,
 }
 
 /// How the script treats rows already in the table.
@@ -18,7 +20,7 @@ pub enum Mode {
     Merge,
 }
 
-/// A script that runs in one transaction, for `psql` or `sqlite3` (or any
+/// A script that runs in one transaction, for `psql`, `sqlite3` or `duckdb` (or any
 /// client that runs several statements).
 pub fn script(dialect: Dialect, table: &str, mode: Mode, origin: &str, files: &[File]) -> String {
     let mut out = format!(
@@ -26,8 +28,9 @@ pub fn script(dialect: Dialect, table: &str, mode: Mode, origin: &str, files: &[
         files.len()
     );
     out.push_str("BEGIN;\n");
-    if dialect == Dialect::Sqlite {
-        // The PostgreSQL extension creates its table; on SQLite it is ours.
+    if dialect != Dialect::Postgres {
+        // The PostgreSQL extension creates its table; on SQLite and DuckDB
+        // it is ours. TEXT is an alias of VARCHAR in DuckDB.
         out.push_str(&format!(
             "CREATE TABLE IF NOT EXISTS {table} (path TEXT PRIMARY KEY, source TEXT NOT NULL);\n"
         ));
@@ -51,8 +54,8 @@ pub fn script(dialect: Dialect, table: &str, mode: Mode, origin: &str, files: &[
 /// A string literal that survives the client as well as the server.
 fn quoted(dialect: Dialect, text: &str) -> String {
     match dialect {
-        // Standard SQL quoting; SQLite has no escapes besides ''.
-        Dialect::Sqlite => format!("'{}'", text.replace('\'', "''")),
+        // Standard SQL quoting; SQLite and DuckDB have no escapes besides ''.
+        Dialect::Sqlite | Dialect::DuckDB => format!("'{}'", text.replace('\'', "''")),
         // Dollar quoting: the text goes through verbatim, whatever
         // standard_conforming_strings says about backslashes, and psql
         // neither interpolates :variables nor reads backslash commands in it.
@@ -129,6 +132,18 @@ mod tests {
         assert!(
             pg.contains("VALUES ('models/a.sql', $dbt$select 'a'$dbt$)"),
             "{pg}"
+        );
+        let duck = script(
+            Dialect::DuckDB,
+            "dbtindb_files",
+            Mode::Replace,
+            "shop",
+            &files,
+        );
+        assert!(
+            duck.contains("CREATE TABLE IF NOT EXISTS dbtindb_files")
+                && duck.contains("VALUES ('models/a.sql', 'select ''a''')"),
+            "{duck}"
         );
     }
 }

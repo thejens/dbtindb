@@ -61,6 +61,8 @@ impl Object for ColumnClass {
                 Ok(Value::from(match self.0 {
                     Dialect::Postgres => format!("character varying({size})"),
                     Dialect::Sqlite => "TEXT".to_owned(),
+                    // DuckDB accepts a length but does not enforce it.
+                    Dialect::DuckDB => "VARCHAR".to_owned(),
                 }))
             }
             "create" => Ok(ColumnObject::value(
@@ -87,6 +89,11 @@ pub fn translate_type(dialect: Dialect, dtype: &str) -> String {
         (Dialect::Sqlite, "string" | "timestamp") => "TEXT",
         (Dialect::Sqlite, "float") => "REAL",
         (Dialect::Sqlite, "integer" | "bigint") => "INTEGER",
+        (Dialect::DuckDB, "string") => "VARCHAR",
+        (Dialect::DuckDB, "timestamp") => "TIMESTAMP",
+        // DuckDB's FLOAT is single precision; dbt's `float` means double.
+        (Dialect::DuckDB, "float") => "DOUBLE",
+        (Dialect::DuckDB, "integer") => "INTEGER",
         _ => return dtype.to_owned(),
     };
     translated.to_owned()
