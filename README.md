@@ -1,8 +1,8 @@
-# dbtindb: run dbt projects inside PostgreSQL and SQLite
+# dbtindb: run dbt projects inside PostgreSQL, SQLite and DuckDB
 
 [![CI](https://github.com/thejens/dbtindb/actions/workflows/ci.yml/badge.svg)](https://github.com/thejens/dbtindb/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![PostgreSQL 14–18 | SQLite 3.37+](https://img.shields.io/badge/PostgreSQL%2014–18%20%7C%20SQLite%203.37%2B-lightgrey)
+![PostgreSQL 14–18 | SQLite 3.37+ | DuckDB 1.5+](https://img.shields.io/badge/PostgreSQL%2014–18%20%7C%20SQLite%203.37%2B%20%7C%20DuckDB%201.5%2B-lightgrey)
 
 **dbtindb is dbt inside the database.** You store a dbt project's files as rows. Then `SELECT * FROM dbtindb_build()` seeds, builds, snapshots and tests it in DAG order, in one transaction. There is no Python, no dbt CLI, no profiles.yml and no orchestrator.
 
@@ -43,11 +43,11 @@ SELECT step, name, action, status FROM dbtindb_build(target_schema => 'analytics
 - **dbt packages:** installed packages such as dbt_utils, with their macros, tests, models, seeds and snapshots.
 - **Atomic builds:** a command runs in one transaction. If a model or an error-severity test fails, nothing changes.
 - **Safe rebuilds:** dbtindb only replaces relations it created and never uses `CASCADE`. Your own views on top of a model block its rebuild instead of disappearing.
-- **Ad-hoc dbt SQL from psql and sqlite3:** `SELECT dbtindb_sql($$select * from {{ ref('customers') }}$$) \gexec` runs a dbt-templated query as if you had typed the compiled SQL.
+- **Ad-hoc dbt SQL from psql, sqlite3 and duckdb:** `SELECT dbtindb_sql($$select * from {{ ref('customers') }}$$) \gexec` runs a dbt-templated query as if you had typed the compiled SQL.
 - **A loader CLI:** `dbtindb load ./my_project --dialect postgres | psql` copies a dbt project from disk into the database.
-- **Two databases, one project:** the same files build in PostgreSQL (as an extension built with [pgrx](https://github.com/pgcentralfoundation/pgrx)) and in SQLite (as a loadable extension).
+- **Three databases, one project:** the same files build in PostgreSQL (as an extension built with [pgrx](https://github.com/pgcentralfoundation/pgrx)), in SQLite (as a loadable extension) and in DuckDB (as an extension on DuckDB's stable C API).
 
-dbtindb is the dbt-shaped sibling of [pgjinja](https://github.com/thejens/pgjinja) and [sqlite-jinja](https://github.com/thejens/sqlite-jinja), which render plain Jinja2 templates in SQL.
+dbtindb is the dbt-shaped sibling of [pgjinja](https://github.com/thejens/pgjinja), [sqlite-jinja](https://github.com/thejens/sqlite-jinja) and [duckdb-jinja](https://github.com/thejens/duckdb-jinja), which render plain Jinja2 templates in SQL.
 
 ## Contents
 
@@ -59,6 +59,7 @@ dbtindb is the dbt-shaped sibling of [pgjinja](https://github.com/thejens/pgjinj
 - [Ad-hoc dbt SQL](#ad-hoc-dbt-sql)
 - [PostgreSQL](#postgresql)
 - [SQLite](#sqlite)
+- [DuckDB](#duckdb)
 - [What is supported from dbt](#what-is-supported-from-dbt)
 - [How a command runs](#how-a-command-runs)
 - [FAQ](#faq)
@@ -69,7 +70,7 @@ dbtindb is the dbt-shaped sibling of [pgjinja](https://github.com/thejens/pgjinj
 dbt is the standard way to manage SQL transformations, but running it means having a CLI, a profile with credentials, and a scheduler somewhere that can reach the database. For many projects that is more machinery than the transformations need:
 
 - **An app's own database:** derived tables, reporting views and reference data that ship with the application and rebuild with one SQL call, from a migration, a cron job (`pg_cron`) or the app itself.
-- **SQLite files:** analytics databases, Datasette instances and local-first apps that carry their dbt project inside the `.sqlite` file.
+- **SQLite and DuckDB files:** analytics databases, Datasette instances, notebooks and local-first apps that carry their dbt project inside the database file.
 - **Locked-down environments:** where the only way in is a SQL connection.
 - **Prototyping:** you can try a dbt model in `psql` without setting up a project.
 
@@ -105,6 +106,22 @@ cargo build --release -p sqlite_dbtindb
 
 ```sql
 .load ./target/release/libsqlite_dbtindb
+```
+
+**DuckDB 1.5 or newer** (including 2.0): the build is packaged into `dbtindb.duckdb_extension`, with the metadata footer DuckDB requires. Pass the library for your platform and DuckDB's name for the platform (as `PRAGMA platform` reports it).
+
+```sh
+git clone https://github.com/thejens/dbtindb.git
+cd dbtindb
+cargo build --release -p duckdb_dbtindb
+python3 crates/duckdb_dbtindb/package.py target/release/libduckdb_dbtindb.dylib --platform osx_arm64
+# target/duckdb/dbtindb.duckdb_extension (libduckdb_dbtindb.so on Linux, duckdb_dbtindb.dll on Windows)
+```
+
+The extension is not signed by DuckDB, so start the CLI with `duckdb -unsigned`, or connect with `allow_unsigned_extensions` set:
+
+```sql
+LOAD './target/duckdb/dbtindb.duckdb_extension';
 ```
 
 **The `dbtindb` CLI**, which loads projects from disk:
@@ -146,16 +163,17 @@ group by 1
 
 ### Loading a project from disk
 
-`dbtindb load` reads a dbt project directory and prints a SQL script that loads it, which you pipe into the database's own client. The CLI never connects to a database, so connection strings, `.pgpass`, SSH tunnels and SQLite paths work as they always do:
+`dbtindb load` reads a dbt project directory and prints a SQL script that loads it, which you pipe into the database's own client. The CLI never connects to a database, so connection strings, `.pgpass`, SSH tunnels and database file paths work as they always do:
 
 ```sh
 dbtindb load ./jaffle_shop --dialect postgres | psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
 dbtindb load ./jaffle_shop --dialect sqlite | sqlite3 app.db
+dbtindb load ./jaffle_shop --dialect duckdb | duckdb app.duckdb
 ```
 
 It takes `dbt_project.yml` and the `.sql`, `.yml`, `.yaml`, `.csv` and `.md` files under the project's model, seed, snapshot, test, analysis, macro and docs paths (as `dbt_project.yml` sets them), and the same for every package in `dbt_packages/`, skipping hidden files, `target/` and anything else. Run `dbt deps` first if the project has packages. The script runs in one transaction. By default it replaces the table's contents, so files deleted on disk disappear from the database; `--merge` only inserts and updates. `--table` loads into a schema-qualified table when the extension's schema is not on the `search_path`. The PostgreSQL script uses dollar quoting, so backslashes, quotes and `:psql_variables` in your files arrive unchanged.
 
-You can also write the rows yourself: a path is a file's path relative to the project root. The PostgreSQL extension creates `dbtindb_files`; on SQLite, `dbtindb load` creates it, or you run `CREATE TABLE dbtindb_files (path TEXT PRIMARY KEY, source TEXT NOT NULL)`.
+You can also write the rows yourself: a path is a file's path relative to the project root. The PostgreSQL extension creates `dbtindb_files`; on SQLite and DuckDB, `dbtindb load` creates it, or you run `CREATE TABLE dbtindb_files (path TEXT PRIMARY KEY, source TEXT NOT NULL)`.
 
 ### Packages
 
@@ -180,7 +198,9 @@ dbt's own cross-database macros are built in, as the `dbt` package: `dbt.dateadd
 
 Pass dates to them as text literals (`"'2024-01-01'"`), not `cast(... as date)`, which SQLite turns into a number. Arrays are not available on SQLite.
 
-dbt_utils 1.3 works on PostgreSQL. On SQLite, its date, string and test macros work, but `union_relations` and `get_relations_by_pattern` do not: they use SQL SQLite lacks (parenthesised `UNION` members, `information_schema`).
+On DuckDB, the defaults run natively, and dbtindb's `duckdb__` versions cover the rest: `dateadd` and `datediff` (on DuckDB's `date_diff`, which counts boundaries crossed, as dbt defines it), `listagg`, `date` and the timestamp macros. Pass dates as typed literals (`"date '2024-01-01'"`).
+
+dbt_utils 1.3 works on PostgreSQL; it has not been tested on DuckDB. On SQLite, its date, string and test macros work, but `union_relations` and `get_relations_by_pattern` do not: they use SQL SQLite lacks (parenthesised `UNION` members, `information_schema`).
 
 ## Commands
 
@@ -215,6 +235,12 @@ The sqlite3 shell has no `\gexec`, so `dbtindb_view(name, sql)` creates (or repl
 ```sql
 SELECT dbtindb_view('q', 'select * from {{ ref("customers") }} where total_cents > 1000');
 SELECT * FROM q;
+```
+
+On DuckDB, `query()` runs the rendered SQL directly:
+
+```sql
+SELECT * FROM query(dbtindb_sql('select * from {{ ref("customers") }} where total_cents > 1000'));
 ```
 
 `dbtindb_view` is also on PostgreSQL, for clients without `\gexec`. Both functions return the rendered SQL. `dbtindb_view` only ever drops a temporary view of that name, and if the new query fails, the old view is kept.
@@ -276,19 +302,47 @@ The functions are `DIRECTONLY`: they can be called from your SQL but not from vi
 
 SQLite only checks a view's columns when the view is queried, so a view model that references a missing column builds fine and fails on first use. Tables fail during the build.
 
+## DuckDB
+
+The functions are the SQLite ones, returning `JSON`: query the steps with `->>` or `unnest`. Options are a selector string (`'+customers'`), JSON text, or a STRUCT, which DuckDB converts:
+
+```sql
+SELECT dbtindb_build({'select': 'tag:nightly', 'vars': {'since': '2024-01-01'}});
+
+SELECT s ->> 'name' AS name, s ->> 'status' AS status
+FROM (SELECT unnest(from_json(dbtindb_build() -> 'steps', '["JSON"]')) AS s);
+```
+
+| Function | Returns |
+|---|---|
+| `dbtindb_build([options])`, `dbtindb_run`, `dbtindb_seed`, `dbtindb_snapshot`, `dbtindb_test` | `{"steps": [...], "logs": [...]}`, as on SQLite |
+| `dbtindb_ls([options])` | A JSON array of nodes |
+| `dbtindb_compile(name [, options])` | The compiled SQL |
+| `dbtindb_sql(sql [, options])` | Ad-hoc SQL rendered against the project, for `query()` |
+
+Models are built in `main`, and a model with `+schema: marts` goes to `main_marts`, as in dbt-duckdb; missing schemas are created. `ref()` renders as `"<schema>"."<name>"` in the database's default catalog. Merge is available as an incremental strategy, and `persist_docs` sets DuckDB comments. DuckDB has no materialized views, and no roles, so `grants` are ignored.
+
+DuckDB gives an extension no way to run SQL in the caller's connection, so the extension works through a connection of its own, which has three consequences:
+
+- A command is **its own transaction**. It commits or rolls back as a whole, whatever your transaction does afterwards.
+- It reads **committed** rows of `dbtindb_files` and your tables. Changes in a transaction that is still open are not visible to it.
+- Only **one dbtindb call** runs at a time per database. A second call made while one runs, including one from a model's SQL, fails at once.
+
+DuckDB binds a view to tables by name each time it is queried, so your own views on a model keep working when dbtindb rebuilds it.
+
 ## What is supported from dbt
 
 | | |
 |---|---|
 | **Materializations** | `view`, `table`, `ephemeral` (inlined as CTEs), `incremental`, `materialized_view` (PostgreSQL), seeds and snapshots. |
-| **Incremental models** | `is_incremental()`, `{{ this }}`, `unique_key` (one or more columns), `incremental_strategy` `append`, `delete+insert` and `merge` (PostgreSQL 15+), `on_schema_change` `ignore`, `fail`, `append_new_columns` and `sync_all_columns`, and `full_refresh` (per call or per model). |
+| **Incremental models** | `is_incremental()`, `{{ this }}`, `unique_key` (one or more columns), `incremental_strategy` `append`, `delete+insert` and `merge` (PostgreSQL 15+ and DuckDB), `on_schema_change` `ignore`, `fail`, `append_new_columns` and `sync_all_columns`, and `full_refresh` (per call or per model). |
 | **Snapshots** | `{% snapshot %}` blocks and dbt 1.9's YAML snapshots (`relation: ref(...)` or `source(...)`). `strategy='timestamp'` (`updated_at`) and `strategy='check'` (`check_cols`, or `'all'`), `unique_key`, and `hard_deletes` `ignore`, `invalidate` (or `invalidate_hard_deletes`) and `new_record`, which adds a version with `dbt_is_deleted = 'True'`. dbt's `dbt_scd_id`, `dbt_updated_at`, `dbt_valid_from` and `dbt_valid_to` columns. Snapshots go to `target_schema`, or the schema their config gives. |
 | **Seeds** | Type inference, `column_types`, `delimiter`. A reload keeps the table when its columns are unchanged. |
 | **Tests** | `unique`, `not_null`, `accepted_values` (`quote`), `relationships`, custom generic tests (`{% test %}`, with or without `arguments:`), package tests (`dbt_utils.expression_is_true`), singular tests, and `severity`, `warn_if`, `error_if`, `fail_calc`, `limit`, `where` and `enabled` configs. Tests on sources work too. `store_failures` (or `store_failures_as: table` or `view`) keeps the failing rows in `<target schema>_dbt_test__audit.<test name>` (on SQLite, in `main`). The rows of a failing `dbtindb_test` stay; a failing build rolls them back with everything else. |
 | **Unit tests** | dbt 1.8 `unit_tests:` with `given` inputs (`ref`, `source`, and `this` for incremental models) in the `dict`, `csv` and `sql` formats, `expect`, rows given inline or as a `fixture:` file (`<test path>/fixtures/**/<name>.csv` or `.sql`), and `overrides` of `vars`, `env_vars` and macros (`is_incremental`, or any macro by name or as `package.macro`, which then returns the given value when the model calls it). Fixture rows are cast to the column types of the inputs, so those must exist in the database (`dbtindb_build` builds them first), unless the rows are given as `sql`. Rows are compared as multisets over the columns `expect` names, and the differing rows are logged. |
-| **Docs** | `{% docs %}` blocks and `doc()` in descriptions, and `persist_docs` as comments on PostgreSQL. |
+| **Docs** | `{% docs %}` blocks and `doc()` in descriptions, and `persist_docs` as comments on PostgreSQL and DuckDB. |
 | **Analyses** | Compiled with `ref`, `source` and macros, never run. |
-| **Grants** | `grants` on PostgreSQL: after a build, the privileges others hold on the relation are made equal to the config, merged as dbt does (`+select` adds grantees). SQLite has no roles and ignores them. |
+| **Grants** | `grants` on PostgreSQL: after a build, the privileges others hold on the relation are made equal to the config, merged as dbt does (`+select` adds grantees). SQLite and DuckDB have no roles and ignore them. |
 | **Config** | `config()` in files, `config:` in property files, and `+key` in `dbt_project.yml`, merged as dbt does (tags union, hooks append). Keys: `materialized`, `schema`, `alias`, `enabled`, `tags`, `meta`, `pre_hook`, `post_hook`, `persist_docs`, `grants`, `full_refresh`, plus the incremental, snapshot, seed and test keys above. |
 | **Hooks** | `pre_hook` and `post_hook` per node, `on-run-start` and `on-run-end` per project and package. Hooks can use `run_query`, `this` and `target`. |
 | **Jinja context** | `ref` (`ref('name')` or `ref('package', 'name')`), `source`, `doc` (`doc('name')` or `doc('package', 'name')`), `config`, `var`, `env_var` (the database's environment is not readable, so only its default or a unit test's override), `this`, `target`, `execute`, `model`, `project_name`, `is_incremental`, `run_query` (agate-like rows and columns), `statement` blocks with `load_result`/`store_result`, `load_relation`, `log`, `print`, `exceptions` (`raise_compiler_error`, `warn`), `adapter` (`dispatch`, `quote`, `execute`, `get_relation`, `load_relation`, `get_columns_in_relation`, `type`), `api.Column` and `api.Relation`, `modules` (`datetime`, `re`, `pytz`), `flags`, `run_started_at`, `invocation_id`, `dbt_version`, `fromjson`, `tojson`, `fromyaml`, `toyaml`, `zip`, `set`, `try_or_compiler_error` and `local_md5`, and Python's string, list and dict methods. Relations and columns are dbt-like objects (`relation.identifier`, `column.quoted`, `column.is_string()`). |
@@ -301,12 +355,12 @@ SQLite only checks a view's columns when the view is queried, so a view model th
 1. **Parse:** every file is read from `dbtindb_files`, and every model, snapshot and test is rendered with `execute = false`, as dbt's parser does. This collects `ref`s, `source`s and `config`. Disabled nodes are dropped, relations are named with `generate_schema_name`/`generate_alias_name`, and duplicate relations are reported.
 2. **Plan:** the selected nodes are ordered topologically. A cycle is reported with its path, for example `dependency cycle: a -> c -> b -> a`. Each node is planned as a replace, an update (incremental, snapshot, seed reload or materialized-view refresh) or a query (tests, and unit tests, which compile their model on fixture rows).
 3. **Execute:** schemas are created, then `on-run-start` runs. Replaced relations are dropped dependents-first, and nodes are built in order with their hooks. Models are rendered again here with `execute = true`, so `run_query` and `is_incremental()` see the database. Last comes `on-run-end`.
-4. All of this runs in one transaction: the caller's on PostgreSQL, and a savepoint on SQLite. Any error rolls back the whole command.
+4. All of this runs in one transaction: the caller's on PostgreSQL, a savepoint on SQLite, and the extension connection's own on DuckDB. Any error rolls back the whole command.
 
 Rebuilds are deliberately conservative:
 
 - dbtindb only drops relations listed in `dbtindb_managed`. If a table you created stands where a model would go, the command fails instead of replacing it.
-- Drops never cascade. A managed view on top of a replaced model is rebuilt with it, but a view of yours makes the rebuild fail, so it is never silently dropped.
+- Drops never cascade. A managed view on top of a replaced model is rebuilt with it, but a view of yours makes the rebuild fail, so it is never silently dropped. (DuckDB's views bind late, so there yours simply keeps working.)
 - Renders have an instruction budget, so a runaway macro cannot pin a database backend.
 - A model cannot call a dbtindb function: a build cannot start another build.
 
@@ -322,7 +376,7 @@ You should if you already run dbt, or if you need a warehouse or the wider dbt e
 
 ### Can I use it on Amazon RDS, Cloud SQL, Supabase or Neon?
 
-Only where you can install custom extensions, which managed services generally do not allow. It works on self-hosted PostgreSQL, in Docker images, and anywhere SQLite can load extensions.
+Only where you can install custom extensions, which managed services generally do not allow. It works on self-hosted PostgreSQL, in Docker images, and anywhere SQLite or DuckDB can load extensions.
 
 ### Who can run a build?
 
@@ -350,9 +404,15 @@ cargo test -p dbtindb-cli
 # SQLite extension and CLI, end to end through Python's sqlite3
 cargo build --release -p sqlite_dbtindb -p dbtindb-cli
 python3 -m unittest discover -s crates/sqlite_dbtindb/tests -v
+
+# DuckDB extension and CLI, end to end through DuckDB's Python package
+cargo build --release -p duckdb_dbtindb -p dbtindb-cli
+python3 crates/duckdb_dbtindb/package.py target/release/libduckdb_dbtindb.dylib --platform osx_arm64
+pip install -r crates/duckdb_dbtindb/tests/requirements.txt
+python3 -m unittest discover -s crates/duckdb_dbtindb/tests -v
 ```
 
-The workspace has four crates. `dbtindb-core` holds the dbt semantics: the project, the Jinja context, selection, the DAG and the materializations. It drives the database through a small `Database` trait. `pg_dbtindb` (over SPI) and `sqlite_dbtindb` (over the SQLite C API) implement that trait and expose the SQL functions. `dbtindb-cli` is the `dbtindb` command.
+The workspace has five crates. `dbtindb-core` holds the dbt semantics: the project, the Jinja context, selection, the DAG and the materializations. It drives the database through a small `Database` trait. `pg_dbtindb` (over SPI), `sqlite_dbtindb` (over the SQLite C API) and `duckdb_dbtindb` (over DuckDB's C extension API) implement that trait and expose the SQL functions. `dbtindb-cli` is the `dbtindb` command.
 
 ## License
 

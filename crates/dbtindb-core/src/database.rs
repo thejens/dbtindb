@@ -62,14 +62,14 @@ pub trait Database: Send + Sync + 'static {
     fn query(&self, sql: &str) -> Result<Table, Error>;
 
     /// Runs a statement with text parameters (`$1`, `$2`, ... on
-    /// PostgreSQL, `?1`, `?2`, ... on SQLite; see [`Database::param`]).
+    /// PostgreSQL and DuckDB, `?1`, `?2`, ... on SQLite; see [`Database::param`]).
     /// `None` binds NULL.
     fn execute(&self, sql: &str, params: &[Option<&str>]) -> Result<(), Error>;
 
     /// The placeholder for parameter `n` (1-based).
     fn param(&self, n: usize) -> String {
         match self.dialect() {
-            Dialect::Postgres => format!("${n}"),
+            Dialect::Postgres | Dialect::DuckDB => format!("${n}"),
             Dialect::Sqlite => format!("?{n}"),
         }
     }

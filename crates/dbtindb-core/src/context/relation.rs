@@ -88,6 +88,7 @@ impl Object for Relation {
                 let kind = match self.dialect {
                     Dialect::Postgres => "PostgresRelation",
                     Dialect::Sqlite => "SQLiteRelation",
+                    Dialect::DuckDB => "DuckDBRelation",
                 };
                 return Some(Value::from_serialize(serde_json::json!({ "type": kind })));
             }

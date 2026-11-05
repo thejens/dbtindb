@@ -38,8 +38,9 @@ pub fn model(
         (Materialized::MaterializedView, _) => {
             if d != Dialect::Postgres {
                 return Err(Error::new(format!(
-                    "{}: SQLite has no materialized views",
-                    node.path
+                    "{}: {} has no materialized views",
+                    node.path,
+                    d.display_name()
                 )));
             }
             stmts.push(run(
@@ -129,21 +130,22 @@ fn incremental_update(
             stmts.push(run(r, insert)?);
         }
         "merge" => {
-            if d != Dialect::Postgres {
+            if d == Dialect::Sqlite {
                 return Err(Error::new(format!(
                     "{}: SQLite has no MERGE; use delete+insert",
                     node.path
                 )));
             }
-            // MERGE arrived in PostgreSQL 15.
-            let version =
-                r.db.query("SELECT current_setting('server_version_num')::int")?;
-            if version
-                .rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(|v| v.as_i64())
-                .is_some_and(|v| v < 150000)
+            // MERGE arrived in PostgreSQL 15 (and DuckDB 1.4, older than
+            // the C API the DuckDB extension needs).
+            if d == Dialect::Postgres
+                && r.db
+                    .query("SELECT current_setting('server_version_num')::int")?
+                    .rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|v| v < 150000)
             {
                 return Err(Error::new(format!(
                     "{}: MERGE needs PostgreSQL 15 or newer; use delete+insert",
@@ -339,13 +341,13 @@ pub fn seed(r: &Runner<'_>, node: &Node, plan: Plan) -> Result<(String, Vec<Stri
 }
 
 /// `persist_docs`: descriptions from property files as comments, on
-/// PostgreSQL (SQLite has no comments).
+/// PostgreSQL and DuckDB (SQLite has no comments).
 pub fn persist_docs(r: &Runner<'_>, node: &Node, rel: &Relation) -> Result<Vec<String>, Error> {
     let d = r.db.dialect();
     let Some(cfg) = node.config.get("persist_docs").and_then(|v| v.as_object()) else {
         return Ok(Vec::new());
     };
-    if d != Dialect::Postgres {
+    if d == Dialect::Sqlite {
         return Ok(Vec::new());
     }
     let mut stmts = Vec::new();

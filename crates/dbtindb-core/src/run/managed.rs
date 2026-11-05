@@ -68,7 +68,7 @@ impl Managed {
         self.forget(rel)?;
         let p = |n| self.db.param(n);
         let now = match self.db.dialect() {
-            Dialect::Postgres => "now()",
+            Dialect::Postgres | Dialect::DuckDB => "now()",
             Dialect::Sqlite => "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         };
         self.db.execute(
