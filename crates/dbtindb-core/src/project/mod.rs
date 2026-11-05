@@ -209,6 +209,11 @@ fn classify(
     if fixture(s, path).is_some() {
         return Ok(());
     }
+    if ext == "py" && under(&s.model_paths, path, package).is_some() {
+        return Err(Error::new(format!(
+            "{path}: Python models are not supported"
+        )));
+    }
     if ext == "sql" {
         if let Some(file) = under(&s.model_paths, path, package) {
             return insert(&mut r.models, "model", file);
@@ -413,6 +418,12 @@ mod tests {
                 .map(|p| p.name.as_str()),
             Some("audit")
         );
+    }
+
+    #[test]
+    fn rejects_python_models() {
+        let err = project(&["models/m.py"]).unwrap_err();
+        assert!(err.0.contains("Python models are not supported"), "{err}");
     }
 
     #[test]

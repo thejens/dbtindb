@@ -212,6 +212,8 @@ fn node_matches(n: &Node, method: &str, value: &str) -> Result<bool, Error> {
         },
         "test_name" => match &n.kind {
             NodeKind::GenericTest { macro_name, .. } => {
+                // `test_unique`, or `<package>.test_unique` for a package's.
+                let macro_name = macro_name.rsplit('.').next().unwrap_or(macro_name);
                 glob(value, macro_name.trim_start_matches("test_"))
             }
             _ => false,

@@ -87,6 +87,11 @@ impl Properties {
             ("analyses", &mut self.analyses),
         ] {
             for entry in list(doc.get(key), &ctx(key))? {
+                if key == "models" && entry.get("versions").is_some() {
+                    return Err(Error::new(format!(
+                        "{path}: model versions (versions:) are not supported"
+                    )));
+                }
                 let mut props = resource(path, entry)?;
                 if key == "snapshots" {
                     props.relation = optional_string(entry, "relation")?;

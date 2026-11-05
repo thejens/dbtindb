@@ -222,7 +222,47 @@ fn parse_node(
             node.path
         )));
     }
+    check_unsupported_config(&node)?;
     Ok(node)
+}
+
+/// Configs that change what dbt builds but that dbtindb does not
+/// implement. Ignoring them would build something else than dbt does, so
+/// they are errors.
+const UNSUPPORTED_CONFIG: &[(&str, &str)] = &[
+    (
+        "incremental_predicates",
+        "incremental_predicates is not supported",
+    ),
+    (
+        "dbt_valid_to_current",
+        "dbt_valid_to_current is not supported; current snapshot rows have dbt_valid_to null",
+    ),
+    (
+        "snapshot_meta_column_names",
+        "snapshot_meta_column_names is not supported; snapshots use dbt's default column names",
+    ),
+];
+
+fn check_unsupported_config(node: &Node) -> Result<(), Error> {
+    for (key, why) in UNSUPPORTED_CONFIG {
+        if node.config.get(key).is_some() {
+            return Err(Error::new(format!("{}: {why}", node.path)));
+        }
+    }
+    // dbt only checks constraints when a contract is enforced.
+    let enforced = node
+        .config
+        .get("contract")
+        .and_then(|c| c.get("enforced"))
+        .is_some_and(|e| e == true);
+    if enforced {
+        return Err(Error::new(format!(
+            "{}: enforced model contracts (contract: {{enforced: true}}) are not supported",
+            node.path
+        )));
+    }
+    Ok(())
 }
 
 /// The config `dbt_project.yml` gives a node of `package`: the package's

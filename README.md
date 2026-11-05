@@ -38,8 +38,9 @@ SELECT step, name, action, status FROM dbtindb_build(target_schema => 'analytics
 - **dbt's own Jinja engine:** templates are rendered with the MiniJinja fork from [dbt v2](https://github.com/dbt-labs/dbt), the Rust engine that dbt itself uses, and not a lookalike.
 - **dbt's commands:** `build`, `run`, `seed`, `snapshot`, `test`, `ls` and `compile`, with dbt's node selection syntax (`+orders`, `tag:nightly`, `path:models/marts`, `@customers`, `config.materialized:table`, ...).
 - **dbt's materializations:** views, tables, ephemeral models, incremental models (append, delete+insert and merge, with `on_schema_change`), materialized views, seeds and snapshots.
-- **dbt's tests:** `unique`, `not_null`, `accepted_values`, `relationships`, your own `{% test %}` blocks and singular tests, with `severity`, `warn_if`, `error_if` and `where`.
-- **dbt project files:** `dbt_project.yml` with folder-level `+config`, property YAML files, `vars`, hooks, `generate_schema_name`/`generate_alias_name` overrides and `adapter.dispatch`.
+- **dbt's tests:** `unique`, `not_null`, `accepted_values`, `relationships`, your own `{% test %}` blocks and singular tests, with `severity`, `warn_if`, `error_if`, `where` and `store_failures`, and dbt 1.8 unit tests with fixture files and overrides.
+- **dbt project files:** `dbt_project.yml` with folder-level `+config`, property YAML files, `vars`, hooks, docs blocks, analyses, `generate_schema_name`/`generate_alias_name` overrides and `adapter.dispatch`.
+- **dbt packages:** installed packages such as dbt_utils, with their macros, tests, models, seeds and snapshots.
 - **Atomic builds:** a command runs in one transaction. If a model or an error-severity test fails, nothing changes.
 - **Safe rebuilds:** dbtindb only replaces relations it created and never uses `CASCADE`. Your own views on top of a model block its rebuild instead of disappearing.
 - **Ad-hoc dbt SQL from psql and sqlite3:** `SELECT dbtindb_sql($$select * from {{ ref('customers') }}$$) \gexec` runs a dbt-templated query as if you had typed the compiled SQL.
@@ -72,7 +73,7 @@ dbt is the standard way to manage SQL transformations, but running it means havi
 - **Locked-down environments:** where the only way in is a SQL connection.
 - **Prototyping:** you can try a dbt model in `psql` without setting up a project.
 
-dbtindb is not a replacement for dbt on a warehouse. It covers the parts of dbt that a single database needs, and refuses the rest loudly (see [what is supported](#what-is-supported-from-dbt)).
+dbtindb is not a replacement for dbt on a warehouse. It covers the parts of dbt that a single database needs. Anything else that would change what gets built is an error rather than silently skipped (see [what is supported](#what-is-supported-from-dbt)).
 
 ## Installation
 
@@ -119,7 +120,7 @@ A project is the set of rows in `dbtindb_files`, one per file, keyed by its path
 | Path | What it is |
 |---|---|
 | `dbt_project.yml` | Optional. `name`, `vars`, the `*-paths` settings (including `analysis-paths` and `docs-paths`), `packages-install-path`, `dispatch`, `on-run-start`/`on-run-end`, and `models:`/`seeds:`/`snapshots:`/`data_tests:` config trees with `+key` settings per folder. |
-| `models/**/<name>.sql` | A model, built as `<name>` (or its `alias`). Model names are unique across folders, as in dbt. |
+| `models/**/<name>.sql` | A model, built as `<name>` (or its `alias`). Model names are unique across a project's folders, as in dbt. Python models (`.py`) are not supported. |
 | `models/**/*.yml` | Properties: sources, descriptions, columns, tests and `config:` for models, seeds, snapshots and analyses, YAML snapshots, and `unit_tests:`. |
 | `seeds/**/<name>.csv` | A seed, loaded into a table with inferred column types (integer, numeric, boolean, date, timestamp, text) or `column_types`. |
 | `snapshots/**/*.sql` | `{% snapshot %}` blocks. Snapshots can also be declared in YAML with `relation:`. |
@@ -279,7 +280,7 @@ SQLite only checks a view's columns when the view is queried, so a view model th
 
 | | |
 |---|---|
-| **Materializations** | `view`, `table`, `ephemeral` (inlined as CTEs), `incremental`, `materialized_view` (PostgreSQL), seeds and snapshots. Custom `{% materialization %}` blocks are not supported. |
+| **Materializations** | `view`, `table`, `ephemeral` (inlined as CTEs), `incremental`, `materialized_view` (PostgreSQL), seeds and snapshots. |
 | **Incremental models** | `is_incremental()`, `{{ this }}`, `unique_key` (one or more columns), `incremental_strategy` `append`, `delete+insert` and `merge` (PostgreSQL 15+), `on_schema_change` `ignore`, `fail`, `append_new_columns` and `sync_all_columns`, and `full_refresh` (per call or per model). |
 | **Snapshots** | `{% snapshot %}` blocks and dbt 1.9's YAML snapshots (`relation: ref(...)` or `source(...)`). `strategy='timestamp'` (`updated_at`) and `strategy='check'` (`check_cols`, or `'all'`), `unique_key`, and `hard_deletes` `ignore`, `invalidate` (or `invalidate_hard_deletes`) and `new_record`, which adds a version with `dbt_is_deleted = 'True'`. dbt's `dbt_scd_id`, `dbt_updated_at`, `dbt_valid_from` and `dbt_valid_to` columns. Snapshots go to `target_schema`, or the schema their config gives. |
 | **Seeds** | Type inference, `column_types`, `delimiter`. A reload keeps the table when its columns are unchanged. |
@@ -289,10 +290,11 @@ SQLite only checks a view's columns when the view is queried, so a view model th
 | **Analyses** | Compiled with `ref`, `source` and macros, never run. |
 | **Grants** | `grants` on PostgreSQL: after a build, the privileges others hold on the relation are made equal to the config, merged as dbt does (`+select` adds grantees). SQLite has no roles and ignores them. |
 | **Config** | `config()` in files, `config:` in property files, and `+key` in `dbt_project.yml`, merged as dbt does (tags union, hooks append). Keys: `materialized`, `schema`, `alias`, `enabled`, `tags`, `meta`, `pre_hook`, `post_hook`, `persist_docs`, `grants`, `full_refresh`, plus the incremental, snapshot, seed and test keys above. |
-| **Hooks** | `pre_hook` and `post_hook` per node, `on-run-start` and `on-run-end` per project. Hooks can use `run_query`, `this` and `target`. |
-| **Jinja context** | `ref` (one argument, or two naming this project), `source`, `doc`, `config`, `var`, `env_var`, `this`, `target`, `execute`, `model`, `project_name`, `is_incremental`, `run_query` (agate-like rows and columns), `statement` blocks with `load_result`/`store_result`, `load_relation`, `log`, `print`, `exceptions` (`raise_compiler_error`, `warn`), `adapter` (`dispatch`, `quote`, `execute`, `get_relation`, `load_relation`, `get_columns_in_relation`, `type`), `api.Column` and `api.Relation`, `modules` (`datetime`, `re`, `pytz`), `flags`, `run_started_at`, `invocation_id`, `dbt_version`, `fromjson`, `tojson`, `fromyaml`, `toyaml`, `zip`, `set`, `try_or_compiler_error` and `local_md5`, and Python's string, list and dict methods. Relations and columns are dbt-like objects (`relation.identifier`, `column.quoted`, `column.is_string()`). |
+| **Hooks** | `pre_hook` and `post_hook` per node, `on-run-start` and `on-run-end` per project and package. Hooks can use `run_query`, `this` and `target`. |
+| **Jinja context** | `ref` (`ref('name')` or `ref('package', 'name')`), `source`, `doc` (`doc('name')` or `doc('package', 'name')`), `config`, `var`, `env_var` (the database's environment is not readable, so only its default or a unit test's override), `this`, `target`, `execute`, `model`, `project_name`, `is_incremental`, `run_query` (agate-like rows and columns), `statement` blocks with `load_result`/`store_result`, `load_relation`, `log`, `print`, `exceptions` (`raise_compiler_error`, `warn`), `adapter` (`dispatch`, `quote`, `execute`, `get_relation`, `load_relation`, `get_columns_in_relation`, `type`), `api.Column` and `api.Relation`, `modules` (`datetime`, `re`, `pytz`), `flags`, `run_started_at`, `invocation_id`, `dbt_version`, `fromjson`, `tojson`, `fromyaml`, `toyaml`, `zip`, `set`, `try_or_compiler_error` and `local_md5`, and Python's string, list and dict methods. Relations and columns are dbt-like objects (`relation.identifier`, `column.quoted`, `column.is_string()`). |
 | **Macros** | Global, as in dbt, and they can override `generate_schema_name` and `generate_alias_name`. Packages and dbt's cross-database macros as described in [Packages](#packages), with dbt's `adapter.dispatch` search order and `dispatch:` config. |
-| **Not supported** | Cross-project or versioned `ref`, `database` configs, Python models, exposures, metrics, semantic models, `dbt source freshness` and `dbt docs`. Each is an error or ignored, never a silently different build. |
+| **Not supported: errors** | Model versions (`versions:`, `ref(..., v=...)`), cross-project `ref` (dbt Mesh), `database` configs, custom materializations (a `materialized` other than those above, even with a `{% materialization %}` block defining it), the `microbatch` incremental strategy and `incremental_predicates`, enforced model contracts (`contract: {enforced: true}`), the snapshot configs `dbt_valid_to_current` and `snapshot_meta_column_names`, and selector methods other than those under [Commands](#commands) (such as `state:` and `result:`). |
+| **Not supported: ignored** | Things that do not change what is built: Python model files, exposures, metrics, semantic models, saved queries, groups and `access`, source `freshness` (there is no `dbt source freshness`), `dbt docs generate`/`serve`, and `selectors.yml` (the CLI warns). An unenforced `contract` and column `constraints` are ignored, as dbt ignores them without an enforced contract. |
 
 ## How a command runs
 
